@@ -9,7 +9,6 @@ class EventBase(BaseModel):
     start_time: time
     location: str
     experience_level: str
-    created_by: str
 
 class EventCreate(EventBase):
     pass
