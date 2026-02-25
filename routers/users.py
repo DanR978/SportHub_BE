@@ -1,10 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Header
+from models.db_event_participant import DBEventParticipant
+from models.db_event import DBEvent
 from models.user import User, UserCreate, SocialLoginRequest, UserUpdate
 from models.db_user import DBUser
 from sqlalchemy.orm import Session
 from database import get_db
 from fastapi.security import OAuth2PasswordRequestForm
 from auth import hash_password, verify_password, create_access_token
+from datetime import date as date_type
 import httpx
 import jwt as pyjwt
 import os
@@ -132,8 +135,6 @@ def get_me(current_user: DBUser = Depends(get_current_user)):
 @router.get("/users/me/stats")
 def get_my_stats(current_user: DBUser = Depends(get_current_user), db: Session = Depends(get_db)):
     try:
-        from models.db_event import DBEvent
-        from models.db_event_participant import DBEventParticipant
         created = db.query(DBEvent).filter(DBEvent.organizer_id == current_user.user_id).count()
         joined = db.query(DBEventParticipant).filter(DBEventParticipant.user_id == current_user.user_id).count()
         return {"created": created, "joined": joined}
@@ -148,3 +149,30 @@ def update_me(updates: UserUpdate, current_user: DBUser = Depends(get_current_us
     db.commit()
     db.refresh(current_user)
     return current_user
+
+@router.get("/users/me/upcoming-events")
+async def get_upcoming_events(db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
+    today = date_type.today()
+    # Events user is organizing
+    organizing = db.query(DBEvent).filter(
+        DBEvent.organizer_id == current_user.user_id,
+        DBEvent.start_date >= today
+    ).order_by(DBEvent.start_date, DBEvent.start_time).all()
+
+    # Events user joined but didn't organize
+    joined_ids = db.query(DBEventParticipant.event_id).filter_by(user_id=current_user.user_id).all()
+    joined_ids = [j[0] for j in joined_ids]
+    joined = db.query(DBEvent).filter(
+        DBEvent.event_id.in_(joined_ids),
+        DBEvent.organizer_id != current_user.user_id,
+        DBEvent.start_date >= today
+    ).order_by(DBEvent.start_date, DBEvent.start_time).all()
+
+    for e in organizing + joined:
+        e.participant_count = db.query(DBEventParticipant).filter_by(event_id=e.event_id).count()
+        e.joined = True
+
+    return {
+        "organizing": organizing,
+        "joined": joined
+    }

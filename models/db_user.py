@@ -18,3 +18,5 @@ class DBUser(Base):
     sports = Column(String, nullable=True)
     avatar_config = Column(String, nullable=True)
     avatar_photo = Column(String, nullable=True)
+    host_rating   = Column(Numeric(3, 2), nullable=True)
+    total_ratings = Column(Integer, default=0)

@@ -25,6 +25,11 @@ class Event(EventBase):
     status: str = 'active'
     participant_count: int = 0
     joined: bool = False
+    organizer_name: str | None = None
+    organizer_avatar: str | None = None
+    organizer_photo: str | None = None
+    host_rating:   float | None = None
+    total_ratings: int = 0
 
     class Config:
         from_attributes = True
