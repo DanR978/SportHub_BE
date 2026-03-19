@@ -4,7 +4,6 @@ from datetime import date
 from typing import Optional
 from decimal import Decimal
 
-
 class UserBase(BaseModel):
     first_name: str
     last_name: str
@@ -13,45 +12,44 @@ class UserBase(BaseModel):
     nationality: Optional[str] = None
     phone_number: Optional[str] = None
 
-
 class UserCreate(UserBase):
     password: str
 
-
 class User(UserBase):
-    user_id: UUID = Field(default_factory=uuid4)
-    bio: Optional[str] = None
-    sports: Optional[str] = None
+    user_id:       UUID = Field(default_factory=uuid4)
+    bio:           Optional[str] = None
+    sports:        Optional[str] = None
     avatar_config: Optional[str] = None
-    avatar_photo: Optional[str] = None
-    host_rating: Optional[Decimal] = None
+    avatar_photo:  Optional[str] = None
+    banner_photo:  Optional[str] = None
+    host_rating:   Optional[Decimal] = None
     total_ratings: Optional[int] = 0
-    instagram: Optional[str] = None
-    facebook: Optional[str] = None
-    is_active: bool = True
+    instagram:     Optional[str] = None
+    facebook:      Optional[str] = None
+    is_active:     Optional[bool] = True
+    is_premium:    Optional[bool] = False
 
     class Config:
         from_attributes = True
 
-
 class SocialLoginRequest(BaseModel):
-    access_token: Optional[str] = None
+    access_token:   Optional[str] = None
     identity_token: Optional[str] = None
-    email: Optional[str] = None
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-
+    email:          Optional[str] = None
+    first_name:     Optional[str] = None
+    last_name:      Optional[str] = None
 
 class UserUpdate(BaseModel):
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    date_of_birth: Optional[date] = None
-    nationality: Optional[str] = None
-    phone_number: Optional[str] = None
-    bio: Optional[str] = None
-    sports: Optional[str] = None
-    avatar_config: Optional[str] = None
-    avatar_photo: Optional[str] = None
-    instagram: Optional[str] = None
-    facebook: Optional[str] = None
-    is_active: Optional[bool] = None
+    first_name:     Optional[str] = None
+    last_name:      Optional[str] = None
+    date_of_birth:  Optional[date] = None
+    nationality:    Optional[str] = None
+    phone_number:   Optional[str] = None
+    bio:            Optional[str] = None
+    sports:         Optional[str] = None
+    avatar_config:  Optional[str] = None
+    avatar_photo:   Optional[str] = None
+    banner_photo:   Optional[str] = None
+    instagram:      Optional[str] = None
+    facebook:       Optional[str] = None
+    is_active:      Optional[bool] = None

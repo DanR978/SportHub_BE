@@ -3,15 +3,17 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, HTTPException, Header
 from models.db_event_participant import DBEventParticipant
 from models.db_host_rating import DBHostRating
-from schemas.event import Event, EventCreate
+from models.db_report import DBReport
+from models.db_block import DBBlock
+from schemas.event import Event, EventCreate, EventUpdate
 from sqlalchemy.orm import Session
 from database import get_db
 from models.db_event import DBEvent
 from models.db_archived_event import DBArchivedEvent
-from auth import get_current_user
+from auth import get_current_user, SECRET_KEY, ALGORITHM
 from models.db_user import DBUser
 from typing import List, Optional
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from geopy.geocoders import Nominatim
 from better_profanity import profanity
 from geopy.distance import geodesic
@@ -20,10 +22,7 @@ from pydantic import BaseModel
 import os
 
 router = APIRouter()
-geolocator = Nominatim(user_agent="sporthub")
-
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
-ALGORITHM = os.getenv("ALGORITHM", "HS256")
+geolocator = Nominatim(user_agent="sportmap")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -68,6 +67,14 @@ def enrich_event(event, db, current_user_id=None):
     return event
 
 
+def get_blocked_ids(db, user_id):
+    """Return set of user IDs that this user has blocked."""
+    if not user_id:
+        return set()
+    blocks = db.query(DBBlock.blocked_id).filter(DBBlock.blocker_id == user_id).all()
+    return {b[0] for b in blocks}
+
+
 def archive_event(db, event, reason='expired'):
     """Move an event to archived_events, preserving participant IDs."""
     participants = db.query(DBEventParticipant).filter_by(event_id=event.event_id).all()
@@ -103,12 +110,41 @@ def archive_event(db, event, reason='expired'):
 
 @router.post("/sports-events", response_model=Event)
 async def create_event(event: EventCreate, db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
-    geo = geolocator.geocode(event.location)
-    lat = geo.latitude if geo else 0.0
-    lng = geo.longitude if geo else 0.0
-
     if profanity.contains_profanity(event.title) or profanity.contains_profanity(event.description or ""):
         raise HTTPException(status_code=400, detail="Content contains inappropriate language")
+
+    # Premium check — only premium users can charge for events
+    if event.cost and event.cost > 0:
+        is_premium = current_user.is_premium and (
+            current_user.premium_expires is None or current_user.premium_expires > datetime.now(timezone.utc)
+        )
+        if not is_premium:
+            raise HTTPException(
+                status_code=403,
+                detail="Premium account required to create paid events. Upgrade for $4.99/month."
+            )
+
+    # 4-hour max duration
+    if event.end_time and event.start_time:
+        start_dt = datetime.combine(date.today(), event.start_time)
+        end_dt = datetime.combine(date.today(), event.end_time)
+        diff_hours = (end_dt - start_dt).total_seconds() / 3600
+        if diff_hours > 4:
+            raise HTTPException(status_code=400, detail="Events cannot last more than 4 hours")
+        if diff_hours <= 0:
+            raise HTTPException(status_code=400, detail="End time must be after start time")
+
+    # Prefer frontend-provided coordinates (pin-drop / autocomplete); geocode only as fallback
+    lat = event.latitude
+    lng = event.longitude
+    if lat is None or lng is None:
+        try:
+            geo = geolocator.geocode(event.location)
+            lat = geo.latitude if geo else 0.0
+            lng = geo.longitude if geo else 0.0
+        except Exception:
+            lat = lat if lat is not None else 0.0
+            lng = lng if lng is not None else 0.0
 
     new_event = DBEvent(
         **event.model_dump(exclude={"sport", "experience_level", "latitude", "longitude", "title", "location", "description"}),
@@ -139,14 +175,19 @@ async def get_events(
     authorization: Optional[str] = Header(default=None),
 ):
     current_user_id = _get_user_id_from_header(authorization, db)
+    blocked = get_blocked_ids(db, current_user_id)
     today = date.today()
     events = db.query(DBEvent).filter(
         DBEvent.status == 'active',
         DBEvent.start_date >= today,
     ).all()
+    result = []
     for event in events:
+        if event.organizer_id in blocked:
+            continue
         enrich_event(event, db, current_user_id)
-    return events
+        result.append(event)
+    return result
 
 
 @router.get("/sports-events/filter", response_model=list[Event])
@@ -162,6 +203,7 @@ async def filter_event(
     authorization: Optional[str] = Header(default=None),
 ):
     current_user_id = _get_user_id_from_header(authorization, db)
+    blocked = get_blocked_ids(db, current_user_id)
     today = date.today()
     query = db.query(DBEvent).filter(DBEvent.status == 'active', DBEvent.start_date >= today)
 
@@ -174,12 +216,12 @@ async def filter_event(
     if date_to:
         query = query.filter(DBEvent.start_date <= date_to)
 
-    events = query.all()
+    events = [e for e in query.all() if e.organizer_id not in blocked]
 
-    if latitude and longitude:
+    if latitude is not None and longitude is not None:
         nearby = []
         for event in events:
-            if event.latitude and event.longitude:
+            if event.latitude is not None and event.longitude is not None:
                 dist = geodesic((latitude, longitude), (event.latitude, event.longitude)).miles
                 if dist <= radius_miles:
                     enrich_event(event, db, current_user_id)
@@ -202,6 +244,38 @@ async def get_event(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
     return enrich_event(event, db, current_user_id)
+
+
+# ── Participants ─────────────────────────────────────────────────────────────
+
+@router.get("/sports-events/{event_id}/participants")
+async def get_participants(event_id: UUID, db: Session = Depends(get_db)):
+    """Returns the list of participants for an event with basic profile info."""
+    event = db.query(DBEvent).filter(DBEvent.event_id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    entries = (
+        db.query(DBEventParticipant)
+        .filter(DBEventParticipant.event_id == event_id)
+        .order_by(DBEventParticipant.joined_at)
+        .all()
+    )
+    participants = []
+    for p in entries:
+        user = db.query(DBUser).filter(DBUser.user_id == p.user_id).first()
+        if not user:
+            continue
+        participants.append({
+            "user_id":       str(user.user_id),
+            "first_name":    user.first_name,
+            "last_name":     user.last_name,
+            "avatar_photo":  user.avatar_photo,
+            "avatar_config": user.avatar_config,
+            "is_organizer":  user.user_id == event.organizer_id,
+            "joined_at":     p.joined_at.isoformat() if p.joined_at else None,
+        })
+    return {"participants": participants, "count": len(participants)}
 
 
 # ── Join / Leave ──────────────────────────────────────────────────────────────
@@ -235,6 +309,61 @@ async def leave_event(event_id: UUID, db: Session = Depends(get_db), current_use
     db.delete(participant)
     db.commit()
     return {"message": "Left event successfully"}
+
+
+# ── Edit Event ───────────────────────────────────────────────────────────────
+
+@router.patch("/sports-events/{event_id}", response_model=Event)
+async def update_event(
+    event_id: UUID,
+    updates: EventUpdate,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    event = db.query(DBEvent).filter(DBEvent.event_id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if event.organizer_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="Only the organizer can edit this event")
+
+    data = updates.model_dump(exclude_unset=True)
+
+    # Profanity check on updated fields
+    if "title" in data and profanity.contains_profanity(data["title"]):
+        raise HTTPException(status_code=400, detail="Title contains inappropriate language")
+    if "description" in data and data["description"] and profanity.contains_profanity(data["description"]):
+        raise HTTPException(status_code=400, detail="Description contains inappropriate language")
+
+    # Normalize casing
+    if "title" in data:
+        data["title"] = data["title"].strip()
+    if "location" in data:
+        data["location"] = data["location"].strip()
+    if "sport" in data:
+        data["sport"] = data["sport"].lower().strip()
+    if "experience_level" in data:
+        data["experience_level"] = data["experience_level"].lower().strip()
+    if "description" in data and data["description"]:
+        data["description"] = data["description"].strip()
+
+    # 4-hour max duration check (use updated or existing values)
+    new_start = data.get("start_time", event.start_time)
+    new_end = data.get("end_time", event.end_time)
+    if new_start and new_end:
+        start_dt = datetime.combine(date.today(), new_start)
+        end_dt = datetime.combine(date.today(), new_end)
+        diff_hours = (end_dt - start_dt).total_seconds() / 3600
+        if diff_hours > 4:
+            raise HTTPException(status_code=400, detail="Events cannot last more than 4 hours")
+        if diff_hours <= 0:
+            raise HTTPException(status_code=400, detail="End time must be after start time")
+
+    for field, value in data.items():
+        setattr(event, field, value)
+
+    db.commit()
+    db.refresh(event)
+    return enrich_event(event, db, current_user.user_id)
 
 
 @router.delete("/sports-events/{event_id}")
@@ -320,25 +449,31 @@ async def rate_host(
 # ── Archive ───────────────────────────────────────────────────────────────────
 
 @router.post("/sports-events/archive-expired")
-async def archive_expired_events(db: Session = Depends(get_db)):
+async def archive_expired_events(
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
     """Archives events whose date has passed or whose end_time today has passed."""
-    now = datetime.utcnow()
-    today = date.today()
+    # Use local time consistently — date.today() is local, so now must be local too
+    now = datetime.now()
+    today = now.date()
 
     # All events with start_date before today
     expired = db.query(DBEvent).filter(DBEvent.start_date < today).all()
 
-    # Also grab today's events where end_time has passed
-    if now.hour > 0:  # avoid edge case at midnight
-        today_events = db.query(DBEvent).filter(DBEvent.start_date == today).all()
-        for event in today_events:
-            if event.end_time and datetime.combine(today, event.end_time) < now:
+    # Also grab today's events where end_time has passed (with buffer)
+    today_events = db.query(DBEvent).filter(DBEvent.start_date == today).all()
+    for event in today_events:
+        if event.end_time:
+            # Archive 30 min after end_time
+            event_end = datetime.combine(today, event.end_time) + timedelta(minutes=30)
+            if now > event_end:
                 expired.append(event)
-            elif not event.end_time and event.start_time:
-                # No end_time: assume 2 hour duration
-                assumed_end = datetime.combine(today, event.start_time) + timedelta(hours=2)
-                if assumed_end < now:
-                    expired.append(event)
+        elif event.start_time:
+            # No end_time: assume 3 hour duration + 30 min buffer
+            assumed_end = datetime.combine(today, event.start_time) + timedelta(hours=3, minutes=30)
+            if now > assumed_end:
+                expired.append(event)
 
     # Deduplicate
     seen = set()
@@ -500,3 +635,166 @@ async def get_user_recent_activity(user_id: UUID, db: Session = Depends(get_db))
         })
 
     return {"activities": activities}
+
+
+# ── Public User Profile ──────────────────────────────────────────────────────
+
+@router.get("/users/{user_id}/profile")
+async def get_user_profile(user_id: UUID, db: Session = Depends(get_db)):
+    """Public profile for any user."""
+    user = db.query(DBUser).filter(DBUser.user_id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "user_id":       str(user.user_id),
+        "first_name":    user.first_name,
+        "last_name":     user.last_name,
+        "bio":           user.bio,
+        "sports":        user.sports,
+        "avatar_config": user.avatar_config,
+        "avatar_photo":  user.avatar_photo,
+        "banner_photo":  user.banner_photo,
+        "host_rating":   float(user.host_rating) if user.host_rating else None,
+        "total_ratings": user.total_ratings or 0,
+        "nationality":   user.nationality,
+        "instagram":     user.instagram,
+        "facebook":      user.facebook,
+    }
+
+
+@router.get("/users/{user_id}/reviews")
+async def get_user_reviews(user_id: UUID, db: Session = Depends(get_db)):
+    """Returns all host ratings received by this user, with reviewer info."""
+    ratings = (
+        db.query(DBHostRating)
+        .filter(DBHostRating.host_id == user_id)
+        .order_by(DBHostRating.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    reviews = []
+    for r in ratings:
+        reviewer = db.query(DBUser).filter(DBUser.user_id == r.rater_id).first()
+        reviews.append({
+            "rating_id":      str(r.rating_id),
+            "rating":         r.rating,
+            "comment":        r.comment,
+            "created_at":     r.created_at.isoformat() if r.created_at else None,
+            "reviewer_name":  f"{reviewer.first_name or ''} {reviewer.last_name or ''}".strip() if reviewer else "Unknown",
+            "reviewer_photo": reviewer.avatar_photo if reviewer else None,
+            "reviewer_avatar":reviewer.avatar_config if reviewer else None,
+        })
+    return {"reviews": reviews}
+
+
+# ── Report ───────────────────────────────────────────────────────────────────
+
+class ReportRequest(BaseModel):
+    target_type: str   # 'event' or 'user'
+    target_id: str
+    reason: str        # 'spam','harassment','inappropriate','safety','other'
+    details: Optional[str] = None
+
+
+@router.post("/reports")
+async def create_report(
+    body: ReportRequest,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    valid_reasons = {'spam', 'harassment', 'inappropriate', 'safety', 'other'}
+    if body.reason not in valid_reasons:
+        raise HTTPException(status_code=400, detail=f"Reason must be one of: {', '.join(valid_reasons)}")
+    if body.target_type not in ('event', 'user'):
+        raise HTTPException(status_code=400, detail="target_type must be 'event' or 'user'")
+
+    # Prevent duplicate reports
+    existing = db.query(DBReport).filter_by(
+        reporter_id=current_user.user_id,
+        target_type=body.target_type,
+        target_id=UUID(body.target_id),
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="You already reported this")
+
+    report = DBReport(
+        reporter_id=current_user.user_id,
+        target_type=body.target_type,
+        target_id=UUID(body.target_id),
+        reason=body.reason,
+        details=body.details,
+    )
+    db.add(report)
+    db.commit()
+    return {"message": "Report submitted. We'll review it shortly."}
+
+
+# ── Block / Unblock ──────────────────────────────────────────────────────────
+
+@router.post("/users/{user_id}/block")
+async def block_user(
+    user_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    if user_id == current_user.user_id:
+        raise HTTPException(status_code=400, detail="Cannot block yourself")
+
+    target = db.query(DBUser).filter(DBUser.user_id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    existing = db.query(DBBlock).filter_by(
+        blocker_id=current_user.user_id, blocked_id=user_id
+    ).first()
+    if existing:
+        return {"message": "Already blocked"}
+
+    db.add(DBBlock(blocker_id=current_user.user_id, blocked_id=user_id))
+
+    # Also remove them from any of your events
+    my_events = db.query(DBEvent).filter(DBEvent.organizer_id == current_user.user_id).all()
+    for event in my_events:
+        part = db.query(DBEventParticipant).filter_by(
+            event_id=event.event_id, user_id=user_id
+        ).first()
+        if part:
+            db.delete(part)
+
+    db.commit()
+    return {"message": "User blocked"}
+
+
+@router.delete("/users/{user_id}/block")
+async def unblock_user(
+    user_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    block = db.query(DBBlock).filter_by(
+        blocker_id=current_user.user_id, blocked_id=user_id
+    ).first()
+    if not block:
+        raise HTTPException(status_code=404, detail="User is not blocked")
+    db.delete(block)
+    db.commit()
+    return {"message": "User unblocked"}
+
+
+@router.get("/users/me/blocked")
+async def get_blocked_users(
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    blocks = db.query(DBBlock).filter(DBBlock.blocker_id == current_user.user_id).all()
+    blocked = []
+    for b in blocks:
+        user = db.query(DBUser).filter(DBUser.user_id == b.blocked_id).first()
+        if user:
+            blocked.append({
+                "user_id": str(user.user_id),
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "avatar_photo": user.avatar_photo,
+            })
+    return {"blocked": blocked}
