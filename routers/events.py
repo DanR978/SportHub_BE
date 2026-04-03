@@ -22,7 +22,7 @@ from pydantic import BaseModel
 import os
 
 router = APIRouter()
-geolocator = Nominatim(user_agent="sportmap")
+geolocator = Nominatim(user_agent="gameradar")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
