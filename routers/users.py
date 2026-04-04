@@ -245,7 +245,7 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)
-APP_NAME = "SportMap"
+APP_NAME = "Game Radar"
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -391,6 +391,13 @@ def get_upcoming_events(current_user: DBUser = Depends(get_current_user), db: Se
 
 # ── Premium ──────────────────────────────────────────────────────────────────
 
+REVENUECAT_SECRET_KEY = os.getenv("REVENUECAT_SECRET_KEY", "")
+
+
+class PremiumActivateRequest(BaseModel):
+    revenuecat_user_id: str
+
+
 @router.get("/users/me/premium")
 def get_premium_status(current_user: DBUser = Depends(get_current_user)):
     is_active = current_user.is_premium and (
@@ -404,11 +411,55 @@ def get_premium_status(current_user: DBUser = Depends(get_current_user)):
 
 
 @router.post("/users/me/premium/activate")
-def activate_premium(db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
-    current_user.is_premium = True
-    current_user.premium_expires = datetime.now(timezone.utc) + timedelta(days=30)
-    db.commit()
-    return {
-        "is_premium": True,
-        "expires": current_user.premium_expires.isoformat(),
-    }
+async def activate_premium(
+    body: PremiumActivateRequest,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """
+    Verify subscription with RevenueCat, then activate premium.
+    Called by the frontend after a successful StoreKit purchase.
+    """
+    if not REVENUECAT_SECRET_KEY:
+        # Fallback for dev/testing — activate without verification
+        current_user.is_premium = True
+        current_user.premium_expires = datetime.now(timezone.utc) + timedelta(days=30)
+        db.commit()
+        return {"is_premium": True, "expires": current_user.premium_expires.isoformat()}
+
+    # Verify with RevenueCat API
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                f"https://api.revenuecat.com/v1/subscribers/{body.revenuecat_user_id}",
+                headers={"Authorization": f"Bearer {REVENUECAT_SECRET_KEY}"},
+            )
+
+        if res.status_code != 200:
+            raise HTTPException(status_code=400, detail="Could not verify subscription")
+
+        subscriber = res.json().get("subscriber", {})
+        entitlements = subscriber.get("entitlements", {})
+        premium_ent = entitlements.get("premium", {})
+
+        if premium_ent.get("expires_date"):
+            expires_str = premium_ent["expires_date"]
+            # RevenueCat returns ISO format with Z suffix
+            expires_dt = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+
+            if expires_dt > datetime.now(timezone.utc):
+                current_user.is_premium = True
+                current_user.premium_expires = expires_dt
+                db.commit()
+                return {
+                    "is_premium": True,
+                    "expires": current_user.premium_expires.isoformat(),
+                }
+
+        raise HTTPException(status_code=400, detail="No active premium subscription found")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Premium] Verification error: {e}")
+        raise HTTPException(status_code=500, detail="Subscription verification failed")

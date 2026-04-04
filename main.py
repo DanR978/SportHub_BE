@@ -21,7 +21,7 @@ app.include_router(users_router)
 
 @app.get("/")
 def read_root():
-    return {"message": "SportMap API is running"}
+    return {"message": "Game Radar API is running"}
 
 
 # Create all tables on startup
