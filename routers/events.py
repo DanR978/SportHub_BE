@@ -1,10 +1,12 @@
 import json
 from uuid import UUID
 from fastapi import APIRouter, Depends, Query, HTTPException, Header
+from fastapi.responses import HTMLResponse
 from models.db_event_participant import DBEventParticipant
 from models.db_host_rating import DBHostRating
 from models.db_report import DBReport
 from models.db_block import DBBlock
+from models.db_bookmark import DBBookmark
 from schemas.event import Event, EventCreate, EventUpdate
 from sqlalchemy.orm import Session
 from database import get_db
@@ -798,3 +800,256 @@ async def get_blocked_users(
                 "avatar_photo": user.avatar_photo,
             })
     return {"blocked": blocked}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADD THESE TO THE TOP OF events.py (imports section):
+#
+#   from models.db_bookmark import DBBookmark
+#   from fastapi.responses import HTMLResponse
+#   from sqlalchemy import func as sql_func
+#
+# Then paste everything below at the BOTTOM of events.py
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ── Share Preview (Open Graph) ────────────────────────────────────────────────
+
+SPORT_EMOJIS = {
+    "soccer": "⚽", "basketball": "🏀", "tennis": "🎾", "volleyball": "🏐",
+    "pickleball": "🏓", "baseball": "⚾", "football": "🏈", "handball": "🤾",
+    "softball": "🥎", "dodgeball": "🎯", "kickball": "⚽",
+}
+
+@router.get("/events/{event_id}/share", response_class=HTMLResponse)
+async def share_preview(event_id: UUID, db: Session = Depends(get_db)):
+    """
+    Serves an HTML page with Open Graph meta tags.
+    When shared on iMessage / WhatsApp / social media, platforms scrape these
+    tags to generate a rich link preview with title, description, and image.
+    """
+    event = db.query(DBEvent).filter(DBEvent.event_id == event_id).first()
+    if not event:
+        return HTMLResponse("<html><body><h1>Event not found</h1></body></html>", status_code=404)
+
+    emoji = SPORT_EMOJIS.get(event.sport.lower(), "🏅")
+    sport_cap = event.sport.capitalize()
+
+    # Format date & time
+    date_str = event.start_date.strftime("%a, %b %d") if event.start_date else ""
+    time_str = ""
+    if event.start_time:
+        h, m = event.start_time.hour, event.start_time.minute
+        time_str = f"{h % 12 or 12}:{m:02d} {'PM' if h >= 12 else 'AM'}"
+
+    participant_count = db.query(DBEventParticipant).filter_by(event_id=event.event_id).count()
+    spots_left = max(0, event.max_players - participant_count)
+
+    description = f"{emoji} {sport_cap} · {date_str} · {time_str}\n📍 {event.location}\n👥 {spots_left} spots left"
+    cost_str = "Free" if not event.cost or float(event.cost) == 0 else f"${event.cost}"
+
+    og_title = f"{event.title} — {sport_cap}"
+    og_desc = f"{date_str} at {time_str} · {event.location} · {cost_str} · {spots_left}/{event.max_players} spots open"
+
+    # Static map image from Google Maps (provides the preview thumbnail)
+    maps_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
+    og_image = ""
+    if event.latitude and event.longitude and maps_key:
+        og_image = (
+            f"https://maps.googleapis.com/maps/api/staticmap"
+            f"?center={event.latitude},{event.longitude}"
+            f"&zoom=14&size=600x314&scale=2"
+            f"&markers=color:green%7C{event.latitude},{event.longitude}"
+            f"&key={maps_key}"
+        )
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="{og_title}" />
+    <meta property="og:description" content="{og_desc}" />
+    {"<meta property='og:image' content='" + og_image + "' />" if og_image else ""}
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="628" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="{og_title}" />
+    <meta name="twitter:description" content="{og_desc}" />
+    {"<meta name='twitter:image' content='" + og_image + "' />" if og_image else ""}
+    <title>{og_title}</title>
+    <style>
+        body {{ font-family: -apple-system, sans-serif; margin: 0; padding: 40px 20px; background: #f8f9fb; text-align: center; }}
+        .card {{ max-width: 420px; margin: 0 auto; background: #fff; border-radius: 16px; padding: 32px 24px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }}
+        .emoji {{ font-size: 48px; margin-bottom: 12px; }}
+        h1 {{ font-size: 22px; color: #1a1a2e; margin: 0 0 8px; }}
+        .sport {{ color: #16a34a; font-weight: 700; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }}
+        .detail {{ color: #666; margin: 6px 0; font-size: 15px; }}
+        .spots {{ background: #e8f5e9; color: #16a34a; font-weight: 700; padding: 8px 16px; border-radius: 8px; display: inline-block; margin-top: 16px; }}
+        .cta {{ display: inline-block; margin-top: 20px; background: #16a34a; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 12px; font-weight: 700; font-size: 16px; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="emoji">{emoji}</div>
+        <p class="sport">{sport_cap}</p>
+        <h1>{event.title}</h1>
+        <p class="detail">📅 {date_str} · {time_str}</p>
+        <p class="detail">📍 {event.location}</p>
+        <p class="detail">💰 {cost_str}</p>
+        <div class="spots">👥 {spots_left} of {event.max_players} spots open</div>
+        <br>
+        <a class="cta" href="#">Open in Game Radar</a>
+    </div>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+# ── Bookmarks (Save Events) ──────────────────────────────────────────────────
+
+@router.post("/sports-events/{event_id}/bookmark")
+async def bookmark_event(
+    event_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    event = db.query(DBEvent).filter(DBEvent.event_id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    existing = db.query(DBBookmark).filter_by(event_id=event_id, user_id=current_user.user_id).first()
+    if existing:
+        return {"status": "already_bookmarked"}
+    db.add(DBBookmark(event_id=event_id, user_id=current_user.user_id))
+    db.commit()
+    return {"status": "bookmarked"}
+
+
+@router.delete("/sports-events/{event_id}/bookmark")
+async def remove_bookmark(
+    event_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    bookmark = db.query(DBBookmark).filter_by(event_id=event_id, user_id=current_user.user_id).first()
+    if bookmark:
+        db.delete(bookmark)
+        db.commit()
+    return {"status": "removed"}
+
+
+@router.get("/users/me/bookmarks", response_model=list[Event])
+async def get_bookmarks(
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    bookmark_ids = (
+        db.query(DBBookmark.event_id)
+        .filter(DBBookmark.user_id == current_user.user_id)
+        .all()
+    )
+    event_ids = [b[0] for b in bookmark_ids]
+    if not event_ids:
+        return []
+
+    events = (
+        db.query(DBEvent)
+        .filter(DBEvent.event_id.in_(event_ids), DBEvent.status == "active")
+        .order_by(DBEvent.start_date)
+        .all()
+    )
+    return [enrich_event(e, db, current_user.user_id) for e in events]
+
+
+# ── Player Stats ──────────────────────────────────────────────────────────────
+
+@router.get("/users/me/stats")
+async def get_my_stats(
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    # Events joined (as participant)
+    events_joined = (
+        db.query(DBEventParticipant)
+        .filter(DBEventParticipant.user_id == current_user.user_id)
+        .count()
+    )
+
+    # Events hosted (as organizer)
+    events_hosted = (
+        db.query(DBEvent)
+        .filter(DBEvent.organizer_id == current_user.user_id)
+        .count()
+    )
+    archived_hosted = (
+        db.query(DBArchivedEvent)
+        .filter(DBArchivedEvent.organizer_id == current_user.user_id)
+        .count()
+    )
+
+    # Archived events participated in
+    archived_joined = (
+        db.query(DBArchivedEvent)
+        .filter(DBArchivedEvent.participant_ids.contains(str(current_user.user_id)))
+        .count()
+    )
+
+    # Top sport (most events joined/hosted)
+    # Count from active events where user is participant or organizer
+    sport_counts = {}
+    participated_events = (
+        db.query(DBEvent.sport)
+        .join(DBEventParticipant, DBEvent.event_id == DBEventParticipant.event_id)
+        .filter(DBEventParticipant.user_id == current_user.user_id)
+        .all()
+    )
+    for (sport,) in participated_events:
+        sport_counts[sport] = sport_counts.get(sport, 0) + 1
+
+    hosted_events = (
+        db.query(DBEvent.sport)
+        .filter(DBEvent.organizer_id == current_user.user_id)
+        .all()
+    )
+    for (sport,) in hosted_events:
+        sport_counts[sport] = sport_counts.get(sport, 0) + 1
+
+    top_sport = max(sport_counts, key=sport_counts.get) if sport_counts else None
+
+    return {
+        "events_joined": events_joined + archived_joined,
+        "events_hosted": events_hosted + archived_hosted,
+        "host_rating": float(current_user.host_rating) if current_user.host_rating else None,
+        "total_ratings": current_user.total_ratings or 0,
+        "top_sport": top_sport,
+    }
+
+
+@router.get("/users/{user_id}/stats")
+async def get_user_stats(user_id: UUID, db: Session = Depends(get_db)):
+    user = db.query(DBUser).filter(DBUser.user_id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    events_joined = (
+        db.query(DBEventParticipant)
+        .filter(DBEventParticipant.user_id == user_id)
+        .count()
+    )
+    events_hosted = (
+        db.query(DBEvent)
+        .filter(DBEvent.organizer_id == user_id)
+        .count()
+    )
+    archived_hosted = (
+        db.query(DBArchivedEvent)
+        .filter(DBArchivedEvent.organizer_id == user_id)
+        .count()
+    )
+
+    return {
+        "events_joined": events_joined,
+        "events_hosted": events_hosted + archived_hosted,
+        "host_rating": float(user.host_rating) if user.host_rating else None,
+        "total_ratings": user.total_ratings or 0,
+    }

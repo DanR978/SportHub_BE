@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Header
+from models.db_event_participant import DBEventParticipant
 from schemas.user import User, UserCreate, SocialLoginRequest, UserUpdate
 from models.db_user import DBUser
 from sqlalchemy.orm import Session
@@ -9,6 +10,9 @@ import httpx
 import jwt as pyjwt
 import json
 import os
+from models.db_event import DBEvent
+from models.db_host_rating import DBHostRating
+from models.db_bookmark import DBBookmark
 
 router = APIRouter()
 
@@ -463,3 +467,64 @@ async def activate_premium(
     except Exception as e:
         print(f"[Premium] Verification error: {e}")
         raise HTTPException(status_code=500, detail="Subscription verification failed")
+
+@router.delete("/users/me")
+async def delete_account(
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """
+    Permanently delete user account and all associated data.
+    - Removes all event participations
+    - Removes all bookmarks
+    - Removes all host ratings given by this user
+    - Deletes all events they organized (and their participants)
+    - Removes block/report records
+    - Deletes the user record
+    """
+    uid = current_user.user_id
+
+    # 1. Remove from all events they joined
+    db.query(DBEventParticipant).filter(
+        DBEventParticipant.user_id == uid
+    ).delete(synchronize_session=False)
+
+    # 2. Remove all bookmarks
+    try:
+        db.query(DBBookmark).filter(DBBookmark.user_id == uid).delete(synchronize_session=False)
+    except Exception:
+        pass  # Table might not exist yet
+
+    # 3. Remove all host ratings they gave
+    db.query(DBHostRating).filter(
+        DBHostRating.rater_id == uid
+    ).delete(synchronize_session=False)
+
+    # 4. Delete all events they organized + their participants
+    organized_events = db.query(DBEvent).filter(
+        DBEvent.organizer_id == uid
+    ).all()
+    for event in organized_events:
+        db.query(DBEventParticipant).filter(
+            DBEventParticipant.event_id == event.event_id
+        ).delete(synchronize_session=False)
+        db.delete(event)
+
+    # 5. Remove block/report records involving this user
+    try:
+        from models.db_block import DBBlock
+        from models.db_report import DBReport
+        db.query(DBBlock).filter(
+            (DBBlock.blocker_id == uid) | (DBBlock.blocked_id == uid)
+        ).delete(synchronize_session=False)
+        db.query(DBReport).filter(
+            DBReport.reporter_id == uid
+        ).delete(synchronize_session=False)
+    except Exception:
+        pass
+
+    # 6. Delete the user
+    db.delete(current_user)
+    db.commit()
+
+    return {"status": "deleted"}
