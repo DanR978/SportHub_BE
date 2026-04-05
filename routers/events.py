@@ -22,6 +22,7 @@ from geopy.distance import geodesic
 from jose import jwt as jose_jwt
 from pydantic import BaseModel
 import os
+import re, base64
 
 router = APIRouter()
 geolocator = Nominatim(user_agent="gameradar")
@@ -107,13 +108,43 @@ def archive_event(db, event, reason='expired'):
     db.query(DBEventParticipant).filter(DBEventParticipant.event_id == event.event_id).delete()
     db.delete(event)
 
+# ── Price evasion detection ───────────────────────────────────────────────────
 
-# ── CRUD ──────────────────────────────────────────────────────────────────────
+PRICE_EVASION_PATTERNS = [
+    r'\$\s?\d+',
+    r'\b\d+\s*(dollars?|bucks?|usd)\b',
+    r'\b(one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|twenty.?five|thirty|forty|fifty)\s*(dollars?|bucks?)\b',
+    r'\b(venmo|cashapp|cash\s?app|zelle|paypal|pay\s?pal|apple\s?pay|google\s?pay)\b',
+    r'\b(send|pay|transfer)\s*(me|us)\b',
+    r'\b(pay|payment|charge|fee|cost|price)\s*(is|of|at)\s*\$?\d+',
+    r'\bentry\s*(fee|cost|price)\b',
+    r'\b(bring|pay)\s*\$?\d+',
+    r'@[a-zA-Z0-9_-]{3,}',
+    r'\b\d+\s*(dólares?|dolares?|pesos?)\b',
+    r'\b(cobra|cobro|pago|cuesta|precio)\b',
+]
+
+_evasion_regex = re.compile('|'.join(PRICE_EVASION_PATTERNS), re.IGNORECASE)
+
+
+def detect_price_evasion(description: str, cost: float) -> bool:
+    """Returns True if event is marked free but description suggests a charge."""
+    if not description or (cost and cost > 0):
+        return False
+    return bool(_evasion_regex.search(description))
+
 
 @router.post("/sports-events", response_model=Event)
 async def create_event(event: EventCreate, db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
     if profanity.contains_profanity(event.title) or profanity.contains_profanity(event.description or ""):
         raise HTTPException(status_code=400, detail="Content contains inappropriate language")
+
+    # Check for price evasion (free event trying to charge in description)
+    if detect_price_evasion(event.description or "", event.cost or 0):
+        raise HTTPException(
+            status_code=400,
+            detail="It looks like this event has a cost. Please set the event price instead of mentioning payment in the description. Upgrade to Premium to create paid events."
+        )
 
     # Premium check — only premium users can charge for events
     if event.cost and event.cost > 0:
@@ -136,7 +167,6 @@ async def create_event(event: EventCreate, db: Session = Depends(get_db), curren
         if diff_hours <= 0:
             raise HTTPException(status_code=400, detail="End time must be after start time")
 
-    # Prefer frontend-provided coordinates (pin-drop / autocomplete); geocode only as fallback
     lat = event.latitude
     lng = event.longitude
     if lat is None or lng is None:
@@ -164,12 +194,10 @@ async def create_event(event: EventCreate, db: Session = Depends(get_db), curren
     db.commit()
     db.refresh(new_event)
 
-    # Auto-add creator as first participant
     db.add(DBEventParticipant(event_id=new_event.event_id, user_id=current_user.user_id))
     db.commit()
 
     return enrich_event(new_event, db, current_user.user_id)
-
 
 @router.get("/sports-events", response_model=list[Event])
 async def get_events(
@@ -312,9 +340,6 @@ async def leave_event(event_id: UUID, db: Session = Depends(get_db), current_use
     db.commit()
     return {"message": "Left event successfully"}
 
-
-# ── Edit Event ───────────────────────────────────────────────────────────────
-
 @router.patch("/sports-events/{event_id}", response_model=Event)
 async def update_event(
     event_id: UUID,
@@ -336,6 +361,15 @@ async def update_event(
     if "description" in data and data["description"] and profanity.contains_profanity(data["description"]):
         raise HTTPException(status_code=400, detail="Description contains inappropriate language")
 
+    # Check price evasion on description updates
+    desc = data.get("description", event.description)
+    cost = data.get("cost", float(event.cost or 0))
+    if detect_price_evasion(desc or "", cost):
+        raise HTTPException(
+            status_code=400,
+            detail="It looks like this event has a cost. Please set the event price instead of mentioning payment in the description."
+        )
+
     # Normalize casing
     if "title" in data:
         data["title"] = data["title"].strip()
@@ -348,7 +382,7 @@ async def update_event(
     if "description" in data and data["description"]:
         data["description"] = data["description"].strip()
 
-    # 4-hour max duration check (use updated or existing values)
+    # 4-hour max duration check
     new_start = data.get("start_time", event.start_time)
     new_end = data.get("end_time", event.end_time)
     if new_start and new_end:

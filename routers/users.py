@@ -6,10 +6,12 @@ from sqlalchemy.orm import Session
 from database import get_db
 from fastapi.security import OAuth2PasswordRequestForm
 from auth import hash_password, verify_password, create_access_token, get_current_user
+from better_profanity import profanity
 import httpx
 import jwt as pyjwt
 import json
 import os
+import base64
 from models.db_event import DBEvent
 from models.db_host_rating import DBHostRating
 from models.db_bookmark import DBBookmark
@@ -32,6 +34,32 @@ async def _get_apple_public_keys():
             _apple_keys_cache["keys"] = res.json()["keys"]
             return _apple_keys_cache["keys"]
     return None
+
+
+# ── Image validation ─────────────────────────────────────────────────────────
+
+MAX_IMAGE_MB = 5
+ALLOWED_IMAGE_PREFIXES = [
+    'data:image/jpeg;base64,', 'data:image/png;base64,',
+    'data:image/webp;base64,', 'data:image/gif;base64,',
+    'data:image/jpg;base64,',
+]
+
+
+def validate_image(value: str) -> None:
+    """Raises HTTPException if image is invalid."""
+    if not value or value == 'null':
+        return
+    if not any(value.startswith(p) for p in ALLOWED_IMAGE_PREFIXES):
+        raise HTTPException(status_code=400, detail="Invalid image format. Use JPEG, PNG, or WebP.")
+    try:
+        raw = base64.b64decode(value.split(',', 1)[1])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image data.")
+    if len(raw) / (1024 * 1024) > MAX_IMAGE_MB:
+        raise HTTPException(status_code=400, detail=f"Image too large. Maximum is {MAX_IMAGE_MB}MB.")
+    if len(raw) < 1000:
+        raise HTTPException(status_code=400, detail="Image appears to be corrupt.")
 
 
 # ── Signup / Login ───────────────────────────────────────────────────────────
@@ -104,11 +132,9 @@ async def apple_login(body: SocialLoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="identity_token is required")
 
     try:
-        # 1. Read token header to find signing key
         unverified_header = pyjwt.get_unverified_header(body.identity_token)
         kid = unverified_header.get("kid")
 
-        # 2. Peek at unverified claims for debugging
         unverified_claims = pyjwt.decode(
             body.identity_token,
             options={"verify_signature": False, "verify_exp": False},
@@ -119,7 +145,6 @@ async def apple_login(body: SocialLoginRequest, db: Session = Depends(get_db)):
         print(f"[Apple Login] Token audience: {token_audience}, Configured APPLE_CLIENT_ID: {APPLE_CLIENT_ID}")
         print(f"[Apple Login] Token kid: {kid}, exp: {token_exp}")
 
-        # 3. Fetch Apple's public keys and find the match
         apple_keys = await _get_apple_public_keys()
         if not apple_keys:
             print("[Apple Login] ERROR: Could not fetch Apple public keys")
@@ -136,7 +161,6 @@ async def apple_login(body: SocialLoginRequest, db: Session = Depends(get_db)):
             print(f"[Apple Login] ERROR: No matching key for kid={kid}")
             raise HTTPException(status_code=401, detail="Apple signing key not found")
 
-        # 4. Build public key and decode
         public_key = pyjwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(matching_key))
 
         if APPLE_CLIENT_ID:
@@ -217,8 +241,6 @@ def get_me(current_user: DBUser = Depends(get_current_user)):
 
 @router.get("/users/me/stats")
 def get_my_stats(current_user: DBUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    from models.db_event import DBEvent
-    from models.db_event_participant import DBEventParticipant
     created = db.query(DBEvent).filter(DBEvent.organizer_id == current_user.user_id).count()
     joined = db.query(DBEventParticipant).filter(
         DBEventParticipant.user_id == current_user.user_id
@@ -228,7 +250,21 @@ def get_my_stats(current_user: DBUser = Depends(get_current_user), db: Session =
 
 @router.patch("/users/me")
 def update_me(updates: UserUpdate, current_user: DBUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    for field, value in updates.model_dump(exclude_unset=True).items():
+    data = updates.model_dump(exclude_unset=True)
+
+    # ── Validate images ──────────────────────────────────────────
+    for field in ['avatar_photo', 'banner_photo']:
+        if field in data and data[field]:
+            validate_image(data[field])
+
+    # ── Check text fields for profanity ──────────────────────────
+    for field in ['bio', 'first_name', 'last_name']:
+        if field in data and data[field]:
+            if profanity.contains_profanity(data[field]):
+                label = 'Bio' if field == 'bio' else 'Name'
+                raise HTTPException(status_code=400, detail=f"{label} contains inappropriate language")
+
+    for field, value in data.items():
         setattr(current_user, field, value)
     db.commit()
     db.refresh(current_user)
@@ -353,8 +389,6 @@ def verify_reset_token(body: dict, db: Session = Depends(get_db)):
 
 @router.get("/users/me/upcoming-events")
 def get_upcoming_events(current_user: DBUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    from models.db_event import DBEvent
-    from models.db_event_participant import DBEventParticipant
     from datetime import date
 
     today = date.today()
@@ -420,10 +454,7 @@ async def activate_premium(
     db: Session = Depends(get_db),
     current_user: DBUser = Depends(get_current_user),
 ):
-    """
-    Verify subscription with RevenueCat, then activate premium.
-    Called by the frontend after a successful StoreKit purchase.
-    """
+    """Verify subscription with RevenueCat, then activate premium."""
     if not REVENUECAT_SECRET_KEY:
         # Fallback for dev/testing — activate without verification
         current_user.is_premium = True
@@ -431,7 +462,6 @@ async def activate_premium(
         db.commit()
         return {"is_premium": True, "expires": current_user.premium_expires.isoformat()}
 
-    # Verify with RevenueCat API
     try:
         async with httpx.AsyncClient() as client:
             res = await client.get(
@@ -448,7 +478,6 @@ async def activate_premium(
 
         if premium_ent.get("expires_date"):
             expires_str = premium_ent["expires_date"]
-            # RevenueCat returns ISO format with Z suffix
             expires_dt = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
 
             if expires_dt > datetime.now(timezone.utc):
@@ -468,20 +497,15 @@ async def activate_premium(
         print(f"[Premium] Verification error: {e}")
         raise HTTPException(status_code=500, detail="Subscription verification failed")
 
+
+# ── Delete Account (permanent) ────────────────────────────────────────────────
+
 @router.delete("/users/me")
 async def delete_account(
     db: Session = Depends(get_db),
     current_user: DBUser = Depends(get_current_user),
 ):
-    """
-    Permanently delete user account and all associated data.
-    - Removes all event participations
-    - Removes all bookmarks
-    - Removes all host ratings given by this user
-    - Deletes all events they organized (and their participants)
-    - Removes block/report records
-    - Deletes the user record
-    """
+    """Permanently delete user account and all associated data."""
     uid = current_user.user_id
 
     # 1. Remove from all events they joined
@@ -493,7 +517,7 @@ async def delete_account(
     try:
         db.query(DBBookmark).filter(DBBookmark.user_id == uid).delete(synchronize_session=False)
     except Exception:
-        pass  # Table might not exist yet
+        pass
 
     # 3. Remove all host ratings they gave
     db.query(DBHostRating).filter(
