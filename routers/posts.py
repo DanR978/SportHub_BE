@@ -11,7 +11,7 @@ from typing import List, Optional
 from uuid import UUID
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
@@ -27,6 +27,12 @@ from models.db_post_reaction import DBPostReaction
 from models.db_comment import DBComment
 from models.db_comment_reaction import DBCommentLike
 from models.db_block import DBBlock
+
+ALLOWED_POST_CONTENT_TYPES = {
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+    "video/mp4", "video/quicktime",
+}
+MAX_POST_MEDIA_MB = 25
 
 
 router = APIRouter(prefix="/feed", tags=["feed"])
@@ -398,6 +404,39 @@ def delete_comment(
     db.delete(comment)
     db.commit()
     return {"status": "deleted"}
+
+
+# ── Media upload ──────────────────────────────────────────────────────────────
+# The client uploads an image / short video and receives a URL that it can
+# then attach to a post via the normal create_post payload. Keeping upload
+# and create separate keeps the create endpoint JSON-only.
+
+@router.post("/media")
+async def upload_post_media(
+    file: UploadFile = File(...),
+    current_user: DBUser = Depends(get_current_user),
+):
+    if file.content_type not in ALLOWED_POST_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content-Type must be one of {ALLOWED_POST_CONTENT_TYPES}",
+        )
+    data = await file.read()
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > MAX_POST_MEDIA_MB:
+        raise HTTPException(status_code=400, detail=f"Media too large ({MAX_POST_MEDIA_MB}MB max)")
+    if len(data) < 500:
+        raise HTTPException(status_code=400, detail="File appears to be corrupt")
+
+    import storage
+    url = storage.upload_bytes(data, file.content_type, prefix="posts")
+    if not url:
+        # S3 not configured — keep working by returning a base64 data URL (dev only).
+        # For videos this is not practical, but for small images it's fine.
+        import base64 as _b64
+        url = f"data:{file.content_type};base64," + _b64.b64encode(data).decode()
+
+    return {"url": url, "content_type": file.content_type, "size_bytes": len(data)}
 
 
 # ── Share counter ─────────────────────────────────────────────────────────────

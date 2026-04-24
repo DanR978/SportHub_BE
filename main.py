@@ -14,6 +14,7 @@ from database import Base, engine, get_db
 from rate_limiter import limiter
 from routers.admin import router as admin_router
 from routers.events import router as events_router
+from routers.friends import router as friends_router
 from routers.legal import router as legal_router
 from routers.messages import router as messages_router
 from routers.posts import router as posts_router
@@ -76,6 +77,7 @@ app.include_router(legal_router)
 app.include_router(admin_router)
 app.include_router(posts_router)
 app.include_router(messages_router)
+app.include_router(friends_router)
 
 
 @app.get("/")
