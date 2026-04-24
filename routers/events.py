@@ -22,7 +22,6 @@ from geopy.distance import geodesic
 from jose import jwt as jose_jwt
 from pydantic import BaseModel
 import os
-import re, base64
 
 router = APIRouter()
 geolocator = Nominatim(user_agent="gameradar")
@@ -108,54 +107,10 @@ def archive_event(db, event, reason='expired'):
     db.query(DBEventParticipant).filter(DBEventParticipant.event_id == event.event_id).delete()
     db.delete(event)
 
-# ── Price evasion detection ───────────────────────────────────────────────────
-
-PRICE_EVASION_PATTERNS = [
-    r'\$\s?\d+',
-    r'\b\d+\s*(dollars?|bucks?|usd)\b',
-    r'\b(one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|twenty.?five|thirty|forty|fifty)\s*(dollars?|bucks?)\b',
-    r'\b(venmo|cashapp|cash\s?app|zelle|paypal|pay\s?pal|apple\s?pay|google\s?pay)\b',
-    r'\b(send|pay|transfer)\s*(me|us)\b',
-    r'\b(pay|payment|charge|fee|cost|price)\s*(is|of|at)\s*\$?\d+',
-    r'\bentry\s*(fee|cost|price)\b',
-    r'\b(bring|pay)\s*\$?\d+',
-    r'@[a-zA-Z0-9_-]{3,}',
-    r'\b\d+\s*(dólares?|dolares?|pesos?)\b',
-    r'\b(cobra|cobro|pago|cuesta|precio)\b',
-]
-
-_evasion_regex = re.compile('|'.join(PRICE_EVASION_PATTERNS), re.IGNORECASE)
-
-
-def detect_price_evasion(description: str, cost: float) -> bool:
-    """Returns True if event is marked free but description suggests a charge."""
-    if not description or (cost and cost > 0):
-        return False
-    return bool(_evasion_regex.search(description))
-
-
 @router.post("/sports-events", response_model=Event)
 async def create_event(event: EventCreate, db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
     if profanity.contains_profanity(event.title) or profanity.contains_profanity(event.description or ""):
         raise HTTPException(status_code=400, detail="Content contains inappropriate language")
-
-    # Check for price evasion (free event trying to charge in description)
-    if detect_price_evasion(event.description or "", event.cost or 0):
-        raise HTTPException(
-            status_code=400,
-            detail="It looks like this event has a cost. Please set the event price instead of mentioning payment in the description. Upgrade to Premium to create paid events."
-        )
-
-    # Premium check — only premium users can charge for events
-    if event.cost and event.cost > 0:
-        is_premium = current_user.is_premium and (
-            current_user.premium_expires is None or current_user.premium_expires > datetime.now(timezone.utc)
-        )
-        if not is_premium:
-            raise HTTPException(
-                status_code=403,
-                detail="Premium account required to create paid events. Upgrade for $4.99/month."
-            )
 
     # 4-hour max duration
     if event.end_time and event.start_time:
@@ -172,11 +127,14 @@ async def create_event(event: EventCreate, db: Session = Depends(get_db), curren
     if lat is None or lng is None:
         try:
             geo = geolocator.geocode(event.location)
-            lat = geo.latitude if geo else 0.0
-            lng = geo.longitude if geo else 0.0
+            if not geo:
+                raise HTTPException(status_code=400, detail="Could not geocode that location. Please provide latitude and longitude manually.")
+            lat = geo.latitude
+            lng = geo.longitude
+        except HTTPException:
+            raise
         except Exception:
-            lat = lat if lat is not None else 0.0
-            lng = lng if lng is not None else 0.0
+            raise HTTPException(status_code=400, detail="Location lookup failed. Please provide latitude and longitude manually.")
 
     new_event = DBEvent(
         **event.model_dump(exclude={"sport", "experience_level", "latitude", "longitude", "title", "location", "description"}),
@@ -312,7 +270,8 @@ async def get_participants(event_id: UUID, db: Session = Depends(get_db)):
 
 @router.post("/sports-events/{event_id}/join")
 async def join_event(event_id: UUID, db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
-    event = db.query(DBEvent).filter(DBEvent.event_id == event_id).first()
+    # Lock the event row so concurrent joins can't both pass the capacity check
+    event = db.query(DBEvent).filter(DBEvent.event_id == event_id).with_for_update().first()
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
     if event.status != 'active':
@@ -325,6 +284,19 @@ async def join_event(event_id: UUID, db: Session = Depends(get_db), current_user
 
     db.add(DBEventParticipant(event_id=event_id, user_id=current_user.user_id))
     db.commit()
+
+    # Notify the organizer — non-blocking; silent if APNs not configured
+    if event.organizer_id and event.organizer_id != current_user.user_id:
+        from notifications import send_push
+        joiner_name = f"{current_user.first_name or ''} {current_user.last_name or ''}".strip() or "A player"
+        send_push(
+            db,
+            event.organizer_id,
+            title=f"{joiner_name} joined your event",
+            body=f'"{event.title}" — {count + 1}/{event.max_players} spots filled',
+            data={"event_id": str(event_id), "type": "participant_joined"},
+        )
+
     return {"message": "Joined event successfully"}
 
 
@@ -360,15 +332,6 @@ async def update_event(
         raise HTTPException(status_code=400, detail="Title contains inappropriate language")
     if "description" in data and data["description"] and profanity.contains_profanity(data["description"]):
         raise HTTPException(status_code=400, detail="Description contains inappropriate language")
-
-    # Check price evasion on description updates
-    desc = data.get("description", event.description)
-    cost = data.get("cost", float(event.cost or 0))
-    if detect_price_evasion(desc or "", cost):
-        raise HTTPException(
-            status_code=400,
-            detail="It looks like this event has a cost. Please set the event price instead of mentioning payment in the description."
-        )
 
     # Normalize casing
     if "title" in data:
@@ -834,17 +797,6 @@ async def get_blocked_users(
                 "avatar_photo": user.avatar_photo,
             })
     return {"blocked": blocked}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ADD THESE TO THE TOP OF events.py (imports section):
-#
-#   from models.db_bookmark import DBBookmark
-#   from fastapi.responses import HTMLResponse
-#   from sqlalchemy import func as sql_func
-#
-# Then paste everything below at the BOTTOM of events.py
-# ══════════════════════════════════════════════════════════════════════════════
 
 
 # ── Share Preview (Open Graph) ────────────────────────────────────────────────

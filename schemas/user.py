@@ -1,6 +1,6 @@
 from uuid import UUID, uuid4
 from pydantic import BaseModel, EmailStr, Field
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 from decimal import Decimal
 
@@ -27,7 +27,8 @@ class User(UserBase):
     instagram:     Optional[str] = None
     facebook:      Optional[str] = None
     is_active:     Optional[bool] = True
-    is_premium:    Optional[bool] = False
+    is_admin:      Optional[bool] = False
+    terms_accepted_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

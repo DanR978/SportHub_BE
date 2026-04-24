@@ -1,11 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, Header
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Header, Request, UploadFile, File
+from pydantic import BaseModel
 from models.db_event_participant import DBEventParticipant
 from schemas.user import User, UserCreate, SocialLoginRequest, UserUpdate
 from models.db_user import DBUser
 from sqlalchemy.orm import Session
 from database import get_db
 from fastapi.security import OAuth2PasswordRequestForm
-from auth import hash_password, verify_password, create_access_token, get_current_user
+from auth import hash_password, verify_password, create_access_token, get_current_user, verify_minimum_age, issue_token_pair, decode_refresh_token
+from rate_limiter import limiter
 from better_profanity import profanity
 import httpx
 import jwt as pyjwt
@@ -15,8 +18,10 @@ import base64
 from models.db_event import DBEvent
 from models.db_host_rating import DBHostRating
 from models.db_bookmark import DBBookmark
+from models.db_device_token import DBDeviceToken
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID", "")
 
@@ -65,9 +70,11 @@ def validate_image(value: str) -> None:
 # ── Signup / Login ───────────────────────────────────────────────────────────
 
 @router.post("/users/signup", response_model=User)
-async def create_user(user: UserCreate, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+async def create_user(request: Request, user: UserCreate, db: Session = Depends(get_db)):
     if len(user.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    verify_minimum_age(user.date_of_birth)
     existing = db.query(DBUser).filter(DBUser.email == user.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -80,12 +87,26 @@ async def create_user(user: UserCreate, db: Session = Depends(get_db)):
 
 
 @router.post("/users/login")
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(DBUser).filter(DBUser.email == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = create_access_token(data={"sub": user.email})
-    return {"access_token": token, "token_type": "bearer"}
+    return issue_token_pair(user.email)
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+@router.post("/users/token/refresh")
+@limiter.limit("20/minute")
+async def refresh(request: Request, body: RefreshRequest, db: Session = Depends(get_db)):
+    email = decode_refresh_token(body.refresh_token)
+    user = db.query(DBUser).filter(DBUser.email == email).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return issue_token_pair(user.email)
 
 
 # ── Google Login ─────────────────────────────────────────────────────────────
@@ -115,10 +136,9 @@ async def google_login(body: SocialLoginRequest, db: Session = Depends(get_db)):
     elif not user.date_of_birth or not user.nationality or not user.first_name:
         is_new = True
 
-    token = create_access_token(data={"sub": user.email})
+    tokens = issue_token_pair(user.email)
     return {
-        "access_token": token,
-        "token_type": "bearer",
+        **tokens,
         "is_new": is_new,
         "user": {"email": user.email, "first_name": user.first_name, "last_name": user.last_name},
     }
@@ -142,23 +162,22 @@ async def apple_login(body: SocialLoginRequest, db: Session = Depends(get_db)):
         )
         token_audience = unverified_claims.get("aud", "")
         token_exp = unverified_claims.get("exp", 0)
-        print(f"[Apple Login] Token audience: {token_audience}, Configured APPLE_CLIENT_ID: {APPLE_CLIENT_ID}")
-        print(f"[Apple Login] Token kid: {kid}, exp: {token_exp}")
+        logger.debug("Apple login: aud=%s configured=%s kid=%s exp=%s", token_audience, APPLE_CLIENT_ID, kid, token_exp)
 
         apple_keys = await _get_apple_public_keys()
         if not apple_keys:
-            print("[Apple Login] ERROR: Could not fetch Apple public keys")
+            logger.error("Apple login: could not fetch JWKS")
             raise HTTPException(status_code=502, detail="Could not fetch Apple public keys")
 
         matching_key = next((k for k in apple_keys if k["kid"] == kid), None)
         if not matching_key:
-            print(f"[Apple Login] Key not found for kid={kid}, refreshing cache...")
+            logger.info("Apple login: kid %s not in cache, refreshing", kid)
             _apple_keys_cache["keys"] = None
             apple_keys = await _get_apple_public_keys()
             matching_key = next((k for k in apple_keys if k["kid"] == kid), None) if apple_keys else None
 
         if not matching_key:
-            print(f"[Apple Login] ERROR: No matching key for kid={kid}")
+            logger.warning("Apple login: no matching key for kid=%s after refresh", kid)
             raise HTTPException(status_code=401, detail="Apple signing key not found")
 
         public_key = pyjwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(matching_key))
@@ -182,10 +201,8 @@ async def apple_login(body: SocialLoginRequest, db: Session = Depends(get_db)):
                 leeway=30,
             )
 
-        print(f"[Apple Login] SUCCESS — decoded email: {decoded.get('email')}")
-
     except pyjwt.ExpiredSignatureError:
-        print("[Apple Login] FAILED: Token has expired")
+        logger.info("Apple login failed: token expired")
         raise HTTPException(status_code=401, detail="Apple token has expired. Please try again.")
     except pyjwt.InvalidAudienceError:
         unverified = pyjwt.decode(
@@ -194,18 +211,18 @@ async def apple_login(body: SocialLoginRequest, db: Session = Depends(get_db)):
             algorithms=["RS256"],
         )
         actual_aud = unverified.get("aud", "unknown")
-        print(f"[Apple Login] FAILED: Audience mismatch — token='{actual_aud}', env='{APPLE_CLIENT_ID}'")
+        logger.warning("Apple login failed: audience mismatch token=%s env=%s", actual_aud, APPLE_CLIENT_ID)
         raise HTTPException(status_code=401, detail=f"Apple audience mismatch. Set APPLE_CLIENT_ID={actual_aud} in your .env")
     except pyjwt.InvalidIssuerError:
-        print("[Apple Login] FAILED: Invalid issuer (not https://appleid.apple.com)")
+        logger.warning("Apple login failed: invalid issuer")
         raise HTTPException(status_code=401, detail="Invalid Apple token issuer")
     except pyjwt.InvalidTokenError as e:
-        print(f"[Apple Login] FAILED: InvalidTokenError — {type(e).__name__}: {e}")
+        logger.warning("Apple login failed: %s", type(e).__name__)
         raise HTTPException(status_code=401, detail=f"Invalid Apple token: {str(e)}")
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[Apple Login] FAILED: Unexpected error — {type(e).__name__}: {e}")
+        logger.exception("Apple login failed unexpectedly")
         raise HTTPException(status_code=401, detail=f"Could not verify Apple token: {str(e)}")
 
     email = decoded.get("email") or body.email
@@ -223,10 +240,9 @@ async def apple_login(body: SocialLoginRequest, db: Session = Depends(get_db)):
     elif not user.date_of_birth or not user.nationality or not user.first_name:
         is_new = True
 
-    token = create_access_token(data={"sub": user.email})
+    tokens = issue_token_pair(user.email)
     return {
-        "access_token": token,
-        "token_type": "bearer",
+        **tokens,
         "is_new": is_new,
         "user": {"email": user.email, "first_name": user.first_name, "last_name": user.last_name},
     }
@@ -239,18 +255,13 @@ def get_me(current_user: DBUser = Depends(get_current_user)):
     return current_user
 
 
-@router.get("/users/me/stats")
-def get_my_stats(current_user: DBUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    created = db.query(DBEvent).filter(DBEvent.organizer_id == current_user.user_id).count()
-    joined = db.query(DBEventParticipant).filter(
-        DBEventParticipant.user_id == current_user.user_id
-    ).count()
-    return {"created": created, "joined": joined}
-
-
 @router.patch("/users/me")
 def update_me(updates: UserUpdate, current_user: DBUser = Depends(get_current_user), db: Session = Depends(get_db)):
     data = updates.model_dump(exclude_unset=True)
+
+    # ── Enforce minimum age when DOB is set/changed ──────────────
+    if "date_of_birth" in data:
+        verify_minimum_age(data["date_of_birth"])
 
     # ── Validate images ──────────────────────────────────────────
     for field in ['avatar_photo', 'banner_photo']:
@@ -271,6 +282,43 @@ def update_me(updates: UserUpdate, current_user: DBUser = Depends(get_current_us
     return current_user
 
 
+# ── Avatar / Banner Upload (multipart, S3-backed when configured) ────────────
+
+ALLOWED_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+
+@router.post("/users/me/avatar")
+async def upload_avatar(
+    file: UploadFile = File(...),
+    kind: str = "avatar",  # 'avatar' or 'banner'
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    if kind not in ("avatar", "banner"):
+        raise HTTPException(status_code=400, detail="kind must be 'avatar' or 'banner'")
+    if file.content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"Content-Type must be one of {ALLOWED_IMAGE_CONTENT_TYPES}")
+
+    data = await file.read()
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > MAX_IMAGE_MB:
+        raise HTTPException(status_code=400, detail=f"Image too large. Maximum is {MAX_IMAGE_MB}MB.")
+    if len(data) < 1000:
+        raise HTTPException(status_code=400, detail="Image appears to be corrupt.")
+
+    import storage
+    url = storage.upload_bytes(data, file.content_type, prefix=f"{kind}s")
+    if not url:
+        # S3 not configured — keep working by storing as base64 in the DB (dev mode)
+        import base64 as _b64
+        url = f"data:{file.content_type};base64," + _b64.b64encode(data).decode()
+
+    field = "avatar_photo" if kind == "avatar" else "banner_photo"
+    setattr(current_user, field, url)
+    db.commit()
+    return {kind: url}
+
+
 # ── Password Reset ───────────────────────────────────────────────────────────
 
 import secrets
@@ -278,7 +326,6 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
-from pydantic import BaseModel
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -300,7 +347,7 @@ class ResetPasswordRequest(BaseModel):
 
 def send_reset_email(to_email: str, token: str, name: str):
     if not SMTP_USER or not SMTP_PASSWORD:
-        print(f"[DEV] Reset token for {to_email}: {token}")
+        logger.warning("SMTP not configured; reset token printed to logs (dev only). token=%s", token)
         return
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Reset your {APP_NAME} password"
@@ -320,16 +367,18 @@ def send_reset_email(to_email: str, token: str, name: str):
             s.starttls()
             s.login(SMTP_USER, SMTP_PASSWORD)
             s.sendmail(FROM_EMAIL, to_email, msg.as_string())
-    except Exception as e:
-        print(f"Email send failed: {e}")
+    except Exception:
+        logger.exception("Failed to send reset email")
 
 
 def send_reset_sms(phone: str, token: str):
-    print(f"[DEV] SMS reset token for {phone}: {token}")
+    # SMS provider not yet integrated. Log token in dev so the flow is testable.
+    logger.warning("SMS provider not configured; reset token printed to logs (dev only). token=%s", token)
 
 
 @router.post("/users/forgot-password")
-def forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
+@limiter.limit("3/minute")
+def forgot_password(request: Request, body: ForgotPasswordRequest, db: Session = Depends(get_db)):
     user = db.query(DBUser).filter(DBUser.email == body.email.lower().strip()).first()
 
     if body.method == "check":
@@ -360,7 +409,8 @@ def forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/users/reset-password")
-def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def reset_password(request: Request, body: ResetPasswordRequest, db: Session = Depends(get_db)):
     user = db.query(DBUser).filter(DBUser.reset_token == body.token).first()
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired code")
@@ -427,75 +477,49 @@ def get_upcoming_events(current_user: DBUser = Depends(get_current_user), db: Se
     }
 
 
-# ── Premium ──────────────────────────────────────────────────────────────────
+# ── Device Tokens (APNs) ──────────────────────────────────────────────────────
 
-REVENUECAT_SECRET_KEY = os.getenv("REVENUECAT_SECRET_KEY", "")
-
-
-class PremiumActivateRequest(BaseModel):
-    revenuecat_user_id: str
+class DeviceTokenRequest(BaseModel):
+    token: str
+    platform: str = "ios"
 
 
-@router.get("/users/me/premium")
-def get_premium_status(current_user: DBUser = Depends(get_current_user)):
-    is_active = current_user.is_premium and (
-        current_user.premium_expires is None
-        or current_user.premium_expires > datetime.now(timezone.utc)
-    )
-    return {
-        "is_premium": is_active,
-        "expires": current_user.premium_expires.isoformat() if current_user.premium_expires else None,
-    }
-
-
-@router.post("/users/me/premium/activate")
-async def activate_premium(
-    body: PremiumActivateRequest,
+@router.post("/users/me/devices")
+def register_device(
+    body: DeviceTokenRequest,
     db: Session = Depends(get_db),
     current_user: DBUser = Depends(get_current_user),
 ):
-    """Verify subscription with RevenueCat, then activate premium."""
-    if not REVENUECAT_SECRET_KEY:
-        # Fallback for dev/testing — activate without verification
-        current_user.is_premium = True
-        current_user.premium_expires = datetime.now(timezone.utc) + timedelta(days=30)
+    if not body.token or len(body.token) < 32:
+        raise HTTPException(status_code=400, detail="Invalid device token")
+
+    existing = db.query(DBDeviceToken).filter(DBDeviceToken.token == body.token).first()
+    if existing:
+        # If token was already registered to a different user (device resale, reinstall),
+        # reassign to current user.
+        existing.user_id = current_user.user_id
+        existing.last_used_at = datetime.now(timezone.utc)
         db.commit()
-        return {"is_premium": True, "expires": current_user.premium_expires.isoformat()}
+        return {"id": str(existing.id)}
 
-    try:
-        async with httpx.AsyncClient() as client:
-            res = await client.get(
-                f"https://api.revenuecat.com/v1/subscribers/{body.revenuecat_user_id}",
-                headers={"Authorization": f"Bearer {REVENUECAT_SECRET_KEY}"},
-            )
+    row = DBDeviceToken(user_id=current_user.user_id, token=body.token, platform=body.platform)
+    db.add(row)
+    db.commit()
+    return {"id": str(row.id)}
 
-        if res.status_code != 200:
-            raise HTTPException(status_code=400, detail="Could not verify subscription")
 
-        subscriber = res.json().get("subscriber", {})
-        entitlements = subscriber.get("entitlements", {})
-        premium_ent = entitlements.get("premium", {})
-
-        if premium_ent.get("expires_date"):
-            expires_str = premium_ent["expires_date"]
-            expires_dt = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
-
-            if expires_dt > datetime.now(timezone.utc):
-                current_user.is_premium = True
-                current_user.premium_expires = expires_dt
-                db.commit()
-                return {
-                    "is_premium": True,
-                    "expires": current_user.premium_expires.isoformat(),
-                }
-
-        raise HTTPException(status_code=400, detail="No active premium subscription found")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[Premium] Verification error: {e}")
-        raise HTTPException(status_code=500, detail="Subscription verification failed")
+@router.delete("/users/me/devices/{token}")
+def unregister_device(
+    token: str,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    deleted = db.query(DBDeviceToken).filter(
+        DBDeviceToken.token == token,
+        DBDeviceToken.user_id == current_user.user_id,
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"deleted": deleted}
 
 
 # ── Delete Account (permanent) ────────────────────────────────────────────────
@@ -547,7 +571,10 @@ async def delete_account(
     except Exception:
         pass
 
-    # 6. Delete the user
+    # 6. Remove APNs device tokens
+    db.query(DBDeviceToken).filter(DBDeviceToken.user_id == uid).delete(synchronize_session=False)
+
+    # 7. Delete the user
     db.delete(current_user)
     db.commit()
 

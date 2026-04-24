@@ -1,5 +1,4 @@
-from sqlalchemy import Column, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
+from sqlalchemy import Column, DateTime, ForeignKey, Uuid
 from sqlalchemy.sql import func
 from database import Base
 
@@ -7,6 +6,6 @@ from database import Base
 class DBEventParticipant(Base):
     __tablename__ = "event_participants"
 
-    event_id = Column(UUID(as_uuid=True), ForeignKey("events.event_id"), primary_key=True)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), primary_key=True)
-    joined_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    event_id = Column(Uuid(as_uuid=True), ForeignKey("events.event_id"), primary_key=True)
+    user_id = Column(Uuid(as_uuid=True), ForeignKey("users.user_id"), primary_key=True)
+    joined_at = Column(DateTime(timezone=True), server_default=func.now())

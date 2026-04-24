@@ -1,6 +1,6 @@
 from passlib.hash import bcrypt
 from jose import jwt
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from fastapi import Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -15,7 +15,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/users/login")
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10080"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
+
+MIN_AGE_YEARS = 13
 
 
 def hash_password(plain_password: str) -> str:
@@ -29,8 +32,37 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 def create_access_token(data: dict) -> str:
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
+    to_encode.update({"type": "access", "exp": expire})
     return jwt.encode(claims=to_encode, key=SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_refresh_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"type": "refresh", "exp": expire})
+    return jwt.encode(claims=to_encode, key=SECRET_KEY, algorithm=ALGORITHM)
+
+
+def issue_token_pair(email: str) -> dict:
+    return {
+        "access_token": create_access_token({"sub": email}),
+        "refresh_token": create_refresh_token({"sub": email}),
+        "token_type": "bearer",
+    }
+
+
+def decode_refresh_token(token: str) -> str:
+    """Return the subject (email) if the token is a valid refresh token; raise 401 otherwise."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.JWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Wrong token type")
+    email = payload.get("sub")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    return email
 
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> DBUser:
@@ -42,7 +74,8 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
-        if email is None:
+        token_type = payload.get("type", "access")  # legacy tokens have no type; treat as access
+        if email is None or token_type != "access":
             raise credentials_exception
     except jwt.JWTError:
         raise credentials_exception
@@ -55,9 +88,20 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 
-def get_optional_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    """Return current user or None — never raises."""
-    try:
-        return get_current_user(token, db)
-    except Exception:
-        return None
+def get_admin_user(current_user: DBUser = Depends(get_current_user)) -> DBUser:
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+
+def verify_minimum_age(dob: date | None) -> None:
+    """Raise 400 if dob is below MIN_AGE_YEARS. No-op if dob is None."""
+    if dob is None:
+        return
+    today = date.today()
+    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+    if age < MIN_AGE_YEARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You must be at least {MIN_AGE_YEARS} years old to use Game Radar.",
+        )

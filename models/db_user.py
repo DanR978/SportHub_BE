@@ -1,12 +1,11 @@
-from sqlalchemy import Boolean, Column, Date, DateTime, String, Time, Float, Integer, Numeric, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Boolean, Column, Date, DateTime, String, Time, Float, Integer, Numeric, ForeignKey, Uuid
 import uuid
 from database import Base
 
 class DBUser(Base):
     __tablename__ = "users"
 
-    user_id        = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id        = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     first_name     = Column(String(50), index=True)
     last_name      = Column(String(50), index=True)
     email          = Column(String, unique=True, index=True)
@@ -24,7 +23,7 @@ class DBUser(Base):
     instagram      = Column(String(100), nullable=True)
     facebook       = Column(String(100), nullable=True)
     is_active      = Column(Boolean, default=True, server_default='true')
+    is_admin       = Column(Boolean, default=False, server_default='false', nullable=False)
     reset_token        = Column(String(10), nullable=True)
     reset_token_expiry = Column(DateTime, nullable=True)
-    is_premium         = Column(Boolean, default=False, server_default='false')
-    premium_expires    = Column(DateTime, nullable=True)
+    terms_accepted_at  = Column(DateTime(timezone=True), nullable=True)
