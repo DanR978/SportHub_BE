@@ -437,6 +437,60 @@ def verify_reset_token(body: dict, db: Session = Depends(get_db)):
 
 # ── Upcoming Events ──────────────────────────────────────────────────────────
 
+@router.get("/users/search")
+def search_users(
+    q: str,
+    limit: int = 20,
+    current_user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Lightweight name-prefix search used by the New Message screen and
+    @-mentions. Matches against first+last name (case-insensitive) and skips
+    the current user and anyone they've blocked / been blocked by.
+    """
+    from sqlalchemy import or_, func as sa_func
+    from models.db_block import DBBlock
+
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []
+
+    blocked_out = {r[0] for r in db.query(DBBlock.blocked_id).filter(DBBlock.blocker_id == current_user.user_id).all()}
+    blocked_in  = {r[0] for r in db.query(DBBlock.blocker_id).filter(DBBlock.blocked_id == current_user.user_id).all()}
+    excluded = blocked_out | blocked_in | {current_user.user_id}
+
+    like = f"%{q.lower()}%"
+    users = (
+        db.query(DBUser)
+        .filter(
+            DBUser.is_active.is_(True),
+            or_(
+                sa_func.lower(DBUser.first_name).like(like),
+                sa_func.lower(DBUser.last_name).like(like),
+                sa_func.lower(sa_func.concat(DBUser.first_name, ' ', DBUser.last_name)).like(like),
+            ),
+        )
+        .limit(limit * 2)
+        .all()
+    )
+    results = []
+    for u in users:
+        if u.user_id in excluded:
+            continue
+        results.append({
+            "user_id":      str(u.user_id),
+            "first_name":   u.first_name,
+            "last_name":    u.last_name,
+            "avatar_photo": u.avatar_photo,
+            "avatar_config":u.avatar_config,
+            "bio":          u.bio,
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
 @router.get("/users/me/upcoming-events")
 def get_upcoming_events(current_user: DBUser = Depends(get_current_user), db: Session = Depends(get_db)):
     from datetime import date
