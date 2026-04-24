@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 
 APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID", "")
 
+# A list of accepted audiences. APPLE_CLIENT_ID may be a single bundle ID or
+# a comma-separated list; we accept all of them. Expo Go uses
+# 'host.exp.Exponent' as its audience so dev builds pre-TestFlight work out
+# of the box.
+_apple_audiences = [a.strip() for a in APPLE_CLIENT_ID.split(",") if a.strip()]
+if "host.exp.Exponent" not in _apple_audiences:
+    _apple_audiences.append("host.exp.Exponent")
+
 # ── Apple JWKS key cache ─────────────────────────────────────────────────────
 _apple_keys_cache = {"keys": None}
 
@@ -182,12 +190,14 @@ async def apple_login(body: SocialLoginRequest, db: Session = Depends(get_db)):
 
         public_key = pyjwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(matching_key))
 
-        if APPLE_CLIENT_ID:
+        if _apple_audiences:
+            # pyjwt accepts audience as a list; verification passes when the
+            # token's aud matches any entry.
             decoded = pyjwt.decode(
                 body.identity_token,
                 public_key,
                 algorithms=["RS256"],
-                audience=APPLE_CLIENT_ID,
+                audience=_apple_audiences,
                 issuer="https://appleid.apple.com",
                 leeway=30,
             )
