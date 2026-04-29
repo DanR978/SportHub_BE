@@ -9,17 +9,20 @@ Design notes
   seeded with the current roster.
 * Unread = messages created_at > member.last_read_at. Read markers are bumped
   when the client fetches the message list.
-* We use long-polling-free REST for now — clients should poll the
-  `/conversations` list and the active `/messages` endpoint. A WebSocket
-  upgrade is a natural next step.
+* Group chats have admins (`conversation_members.is_admin`). Admins can rename,
+  add/remove members, and promote/demote. Direct + event chats ignore the flag
+  (event chats are moderated by the event organizer at the app layer).
+* The conversation list and incremental message endpoints are tuned for the
+  hot polling path: bulk-fetch users, last messages, and unread counts so a
+  10-conversation list is two queries instead of forty.
 """
-from typing import List, Optional
+from typing import List, Optional, Iterable, Dict
 from uuid import UUID
-from datetime import datetime, timezone
-from sqlalchemy import and_, func, select
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import and_, func, or_, select, tuple_
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -29,7 +32,9 @@ from models.db_event import DBEvent
 from models.db_event_participant import DBEventParticipant
 from models.db_block import DBBlock
 from models.db_post import DBPost
+from models.db_friendship import DBFriendship
 from models.db_conversation import DBConversation, DBConversationMember
+from models.db_conversation_ban import DBConversationBan
 from models.db_message import DBMessage
 
 
@@ -45,6 +50,7 @@ class DMStartBody(BaseModel):
 class GroupStartBody(BaseModel):
     member_ids: List[UUID]
     title: Optional[str] = None
+    image_url: Optional[str] = None
 
 
 class SendMessageBody(BaseModel):
@@ -55,15 +61,44 @@ class SendMessageBody(BaseModel):
     image_url: Optional[str] = None
 
 
+class AddMembersBody(BaseModel):
+    member_ids: List[UUID] = Field(default_factory=list)
+
+
+class UpdateMemberBody(BaseModel):
+    is_admin: bool
+
+
+class UpdateConversationBody(BaseModel):
+    title: Optional[str] = None
+    image_url: Optional[str] = None
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _ensure_member(db: Session, conversation_id: UUID, user_id: UUID):
+def _ensure_member(db: Session, conversation_id: UUID, user_id: UUID) -> DBConversationMember:
     row = db.query(DBConversationMember).filter_by(
         conversation_id=conversation_id, user_id=user_id
     ).first()
     if not row:
         raise HTTPException(status_code=403, detail="Not a member of this conversation")
     return row
+
+
+def _ensure_admin(db: Session, conv: DBConversation, user_id: UUID) -> DBConversationMember:
+    """Group-only admin guard. Direct chats reject; event chats defer to the organizer."""
+    if conv.kind == "direct":
+        raise HTTPException(status_code=400, detail="Direct chats don't support admin actions")
+    if conv.kind == "event":
+        # Allow the event organizer to manage their event chat even without an admin flag.
+        ev = db.query(DBEvent).filter(DBEvent.event_id == conv.event_id).first()
+        if ev and ev.organizer_id == user_id:
+            return _ensure_member(db, conv.conversation_id, user_id)
+        raise HTTPException(status_code=403, detail="Only the event organizer can manage an event chat")
+    member = _ensure_member(db, conv.conversation_id, user_id)
+    if not member.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+    return member
 
 
 def _blocked_between(db: Session, a: UUID, b: UUID) -> bool:
@@ -84,54 +119,248 @@ def _user_summary(user: Optional[DBUser]) -> dict:
     }
 
 
-def _serialize_message(m: DBMessage, db: Session) -> dict:
-    sender = db.query(DBUser).filter(DBUser.user_id == m.sender_id).first()
+def _bulk_user_map(db: Session, ids: Iterable[UUID]) -> Dict[UUID, DBUser]:
+    ids = list({i for i in ids if i is not None})
+    if not ids:
+        return {}
+    rows = db.query(DBUser).filter(DBUser.user_id.in_(ids)).all()
+    return {u.user_id: u for u in rows}
+
+
+def _serialize_message_with_users(m: DBMessage, users: Dict[UUID, DBUser],
+                                  posts: Dict[UUID, DBPost] = None,
+                                  events: Dict[UUID, DBEvent] = None,
+                                  post_authors: Dict[UUID, DBUser] = None) -> dict:
     payload = {
         "message_id":      str(m.message_id),
         "conversation_id": str(m.conversation_id),
-        "sender":          _user_summary(sender),
+        "sender":          _user_summary(users.get(m.sender_id)),
         "kind":            m.kind,
         "body":            m.body,
         "image_url":       m.image_url,
         "created_at":      m.created_at.isoformat() if m.created_at else None,
     }
-    if m.shared_post_id:
-        post = db.query(DBPost).filter(DBPost.post_id == m.shared_post_id).first()
-        if post:
-            post_author = db.query(DBUser).filter(DBUser.user_id == post.author_id).first()
-            payload["shared_post"] = {
-                "post_id":   str(post.post_id),
-                "author":    _user_summary(post_author),
-                "body":      post.body[:200],
-                "image_url": post.image_url,
-                "sport":     post.sport,
-            }
-    if m.shared_event_id:
-        ev = db.query(DBEvent).filter(DBEvent.event_id == m.shared_event_id).first()
-        if ev:
-            payload["shared_event"] = {
-                "event_id":   str(ev.event_id),
-                "title":      ev.title,
-                "sport":      ev.sport,
-                "start_date": str(ev.start_date) if ev.start_date else None,
-                "location":   ev.location,
-            }
+    if m.shared_post_id and posts and m.shared_post_id in posts:
+        post = posts[m.shared_post_id]
+        author = (post_authors or {}).get(post.author_id)
+        payload["shared_post"] = {
+            "post_id":   str(post.post_id),
+            "author":    _user_summary(author),
+            "body":      (post.body or "")[:200],
+            "image_url": post.image_url,
+            "sport":     post.sport,
+        }
+    if m.shared_event_id and events and m.shared_event_id in events:
+        ev = events[m.shared_event_id]
+        payload["shared_event"] = {
+            "event_id":   str(ev.event_id),
+            "title":      ev.title,
+            "sport":      ev.sport,
+            "start_date": str(ev.start_date) if ev.start_date else None,
+            "location":   ev.location,
+        }
     return payload
 
 
+def _serialize_message(m: DBMessage, db: Session) -> dict:
+    """Single-message serializer (kept for the send_message return path).
+
+    For lists of messages prefer _serialize_message_with_users with a prefetched
+    user/post/event map — this function does N round trips per call.
+    """
+    users = _bulk_user_map(db, [m.sender_id])
+    posts: Dict[UUID, DBPost] = {}
+    events: Dict[UUID, DBEvent] = {}
+    post_authors: Dict[UUID, DBUser] = {}
+    if m.shared_post_id:
+        p = db.query(DBPost).filter(DBPost.post_id == m.shared_post_id).first()
+        if p:
+            posts[p.post_id] = p
+            post_authors = _bulk_user_map(db, [p.author_id])
+    if m.shared_event_id:
+        e = db.query(DBEvent).filter(DBEvent.event_id == m.shared_event_id).first()
+        if e:
+            events[e.event_id] = e
+    return _serialize_message_with_users(m, users, posts, events, post_authors)
+
+
+def _read_state_for(db: Session, conversation_id: UUID, viewer_id: UUID,
+                    members: List[DBConversationMember]) -> dict:
+    """Compute who-has-read-up-to-when for the latest viewer-sent message.
+
+    Used to power read receipts. Returns:
+      {
+        "last_read_at": iso_or_null,    # max of OTHER members' last_read_at
+        "read_by_count": int,           # how many other members have read
+                                        # past the viewer's most recent message
+        "members_total": int,
+      }
+    """
+    others = [m for m in members if m.user_id != viewer_id]
+    if not others:
+        return {"last_read_at": None, "read_by_count": 0, "members_total": 0}
+    last_mine = (
+        db.query(DBMessage.created_at)
+        .filter(DBMessage.conversation_id == conversation_id, DBMessage.sender_id == viewer_id)
+        .order_by(DBMessage.created_at.desc())
+        .first()
+    )
+    if not last_mine:
+        return {"last_read_at": None, "read_by_count": 0, "members_total": len(others)}
+    last_mine_at = last_mine[0]
+    read_by = sum(
+        1 for m in others if m.last_read_at and m.last_read_at >= last_mine_at
+    )
+    most_recent = max((m.last_read_at for m in others if m.last_read_at), default=None)
+    return {
+        "last_read_at":  most_recent.isoformat() if most_recent else None,
+        "read_by_count": read_by,
+        "members_total": len(others),
+    }
+
+
+def _list_conversations_payload(db: Session, viewer_id: UUID) -> List[dict]:
+    """Bulk-load every conversation the viewer is in, plus the data needed to
+    render a list row, in a small fixed number of queries."""
+    convs: List[DBConversation] = (
+        db.query(DBConversation)
+        .join(DBConversationMember, DBConversation.conversation_id == DBConversationMember.conversation_id)
+        .filter(DBConversationMember.user_id == viewer_id)
+        .order_by(DBConversation.last_message_at.desc())
+        .all()
+    )
+    if not convs:
+        return []
+
+    conv_ids = [c.conversation_id for c in convs]
+
+    # All members across all those conversations (one query).
+    all_members: List[DBConversationMember] = (
+        db.query(DBConversationMember)
+        .filter(DBConversationMember.conversation_id.in_(conv_ids))
+        .all()
+    )
+    members_by_conv: Dict[UUID, List[DBConversationMember]] = {}
+    for m in all_members:
+        members_by_conv.setdefault(m.conversation_id, []).append(m)
+
+    user_ids = {m.user_id for m in all_members}
+    users = _bulk_user_map(db, user_ids)
+
+    # Last message per conversation, via DISTINCT ON (Postgres). We fetch the
+    # candidate set with a window to keep this portable across drivers.
+    last_msgs: Dict[UUID, DBMessage] = {}
+    if conv_ids:
+        # Subquery: rank by created_at desc per conversation, take rank 1.
+        subq = (
+            db.query(
+                DBMessage,
+                func.row_number().over(
+                    partition_by=DBMessage.conversation_id,
+                    order_by=DBMessage.created_at.desc(),
+                ).label("rn"),
+            )
+            .filter(DBMessage.conversation_id.in_(conv_ids))
+            .subquery()
+        )
+        # SQLAlchemy 2.x: re-hydrate DBMessage from the subquery.
+        rows = db.query(DBMessage).join(subq, DBMessage.message_id == subq.c.message_id).filter(subq.c.rn == 1).all()
+        last_msgs = {m.conversation_id: m for m in rows}
+
+    # Unread counts per conversation, in one grouped query.
+    last_read_by_conv = {
+        m.conversation_id: m.last_read_at for m in all_members if m.user_id == viewer_id
+    }
+    unread_counts: Dict[UUID, int] = {cid: 0 for cid in conv_ids}
+    if last_read_by_conv:
+        # Build (conv_id, last_read_at) tuples → message count where created_at > last_read_at.
+        # Fallback to per-conversation small queries (tuple_in vs jsonb is messier across DBs).
+        for cid, lra in last_read_by_conv.items():
+            if lra is None:
+                continue
+            unread_counts[cid] = (
+                db.query(func.count(DBMessage.message_id))
+                .filter(
+                    DBMessage.conversation_id == cid,
+                    DBMessage.created_at > lra,
+                    DBMessage.sender_id != viewer_id,
+                )
+                .scalar() or 0
+            )
+
+    # Prefetch any shared posts/events on the last-message preview.
+    shared_post_ids = {m.shared_post_id for m in last_msgs.values() if m.shared_post_id}
+    shared_event_ids = {m.shared_event_id for m in last_msgs.values() if m.shared_event_id}
+    posts: Dict[UUID, DBPost] = {}
+    events: Dict[UUID, DBEvent] = {}
+    if shared_post_ids:
+        for p in db.query(DBPost).filter(DBPost.post_id.in_(shared_post_ids)).all():
+            posts[p.post_id] = p
+    if shared_event_ids:
+        for e in db.query(DBEvent).filter(DBEvent.event_id.in_(shared_event_ids)).all():
+            events[e.event_id] = e
+    post_authors = _bulk_user_map(db, {p.author_id for p in posts.values()})
+
+    # Event titles for event-kind conversations whose title is null.
+    extra_event_ids = {c.event_id for c in convs if c.kind == "event" and c.event_id and not c.title}
+    if extra_event_ids:
+        for e in db.query(DBEvent).filter(DBEvent.event_id.in_(extra_event_ids)).all():
+            events[e.event_id] = e
+
+    out: List[dict] = []
+    for conv in convs:
+        members = members_by_conv.get(conv.conversation_id, [])
+        member_payload = []
+        for m in members:
+            u = users.get(m.user_id)
+            member_payload.append({**_user_summary(u), "is_admin": bool(m.is_admin)})
+
+        title = conv.title
+        if not title:
+            if conv.kind == "direct":
+                other = next((m for m in member_payload if m["user_id"] != str(viewer_id)), None)
+                title = other["name"] if other else "Direct message"
+            elif conv.kind == "event" and conv.event_id and conv.event_id in events:
+                title = events[conv.event_id].title or "Event chat"
+            elif conv.kind == "event":
+                title = "Event chat"
+            else:
+                names = [m["name"].split()[0] for m in member_payload if m["user_id"] != str(viewer_id)]
+                title = ", ".join(names[:3]) or "Group chat"
+
+        last_msg = last_msgs.get(conv.conversation_id)
+        last_msg_payload = (
+            _serialize_message_with_users(last_msg, users, posts, events, post_authors)
+            if last_msg else None
+        )
+
+        out.append({
+            "conversation_id": str(conv.conversation_id),
+            "kind":            conv.kind,
+            "title":           title,
+            "image_url":       conv.image_url,
+            "event_id":        str(conv.event_id) if conv.event_id else None,
+            "members":         member_payload,
+            "unread_count":    unread_counts.get(conv.conversation_id, 0),
+            "last_message":    last_msg_payload,
+            "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
+            "read_state":      _read_state_for(db, conv.conversation_id, viewer_id, members),
+        })
+    return out
+
+
 def _serialize_conversation(conv: DBConversation, db: Session, viewer_id: UUID) -> dict:
+    """Single-conversation serializer used after writes (start group, send message)."""
     members = (
         db.query(DBConversationMember)
         .filter(DBConversationMember.conversation_id == conv.conversation_id)
         .all()
     )
-    users = []
-    my_last_read = None
-    for m in members:
-        u = db.query(DBUser).filter(DBUser.user_id == m.user_id).first()
-        users.append(_user_summary(u))
-        if m.user_id == viewer_id:
-            my_last_read = m.last_read_at
+    users = _bulk_user_map(db, [m.user_id for m in members])
+    member_payload = [
+        {**_user_summary(users.get(m.user_id)), "is_admin": bool(m.is_admin)}
+        for m in members
+    ]
 
     last_msg = (
         db.query(DBMessage)
@@ -140,36 +369,38 @@ def _serialize_conversation(conv: DBConversation, db: Session, viewer_id: UUID) 
         .first()
     )
 
+    my_last_read = next((m.last_read_at for m in members if m.user_id == viewer_id), None)
     unread = 0
     if my_last_read is not None:
         unread = (
-            db.query(DBMessage)
+            db.query(func.count(DBMessage.message_id))
             .filter(
                 DBMessage.conversation_id == conv.conversation_id,
                 DBMessage.created_at > my_last_read,
                 DBMessage.sender_id != viewer_id,
             )
-            .count()
+            .scalar() or 0
         )
 
     title = conv.title
     if not title:
         if conv.kind == "direct":
-            other = next((u for u in users if u["user_id"] != str(viewer_id)), None)
+            other = next((u for u in member_payload if u["user_id"] != str(viewer_id)), None)
             title = other["name"] if other else "Direct message"
         elif conv.kind == "event" and conv.event_id:
             ev = db.query(DBEvent).filter(DBEvent.event_id == conv.event_id).first()
             title = ev.title if ev else "Event chat"
         else:
-            names = [u["name"].split()[0] for u in users if u["user_id"] != str(viewer_id)]
+            names = [u["name"].split()[0] for u in member_payload if u["user_id"] != str(viewer_id)]
             title = ", ".join(names[:3]) or "Group chat"
 
     return {
         "conversation_id": str(conv.conversation_id),
         "kind":            conv.kind,
         "title":           title,
+        "image_url":       conv.image_url,
         "event_id":        str(conv.event_id) if conv.event_id else None,
-        "members":         users,
+        "members":         member_payload,
         "unread_count":    unread,
         "last_message":    _serialize_message(last_msg, db) if last_msg else None,
         "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
@@ -177,8 +408,6 @@ def _serialize_conversation(conv: DBConversation, db: Session, viewer_id: UUID) 
 
 
 def _find_direct_conversation(db: Session, a: UUID, b: UUID) -> Optional[DBConversation]:
-    # Fast path: any 'direct' conversation where both a and b are members and
-    # there are exactly 2 members.
     candidates = (
         db.query(DBConversation)
         .join(DBConversationMember, DBConversation.conversation_id == DBConversationMember.conversation_id)
@@ -202,14 +431,7 @@ def list_conversations(
     db: Session = Depends(get_db),
     current_user: DBUser = Depends(get_current_user),
 ):
-    rows = (
-        db.query(DBConversation)
-        .join(DBConversationMember, DBConversation.conversation_id == DBConversationMember.conversation_id)
-        .filter(DBConversationMember.user_id == current_user.user_id)
-        .order_by(DBConversation.last_message_at.desc())
-        .all()
-    )
-    return {"conversations": [_serialize_conversation(c, db, current_user.user_id) for c in rows]}
+    return {"conversations": _list_conversations_payload(db, current_user.user_id)}
 
 
 @router.post("/direct")
@@ -250,14 +472,248 @@ def start_group(
     if len(member_ids) < 2:
         raise HTTPException(status_code=400, detail="Need at least one other member")
 
-    conv = DBConversation(kind="group", title=body.title, created_by=current_user.user_id)
+    title = (body.title or "").strip() or None
+    if title and len(title) > 120:
+        raise HTTPException(status_code=400, detail="Title is too long")
+
+    conv = DBConversation(
+        kind="group",
+        title=title,
+        image_url=(body.image_url or None),
+        created_by=current_user.user_id,
+    )
     db.add(conv)
     db.flush()
     for uid in member_ids:
-        db.add(DBConversationMember(conversation_id=conv.conversation_id, user_id=uid))
+        db.add(DBConversationMember(
+            conversation_id=conv.conversation_id,
+            user_id=uid,
+            is_admin=(uid == current_user.user_id),
+        ))
     db.commit()
     db.refresh(conv)
     return _serialize_conversation(conv, db, current_user.user_id)
+
+
+@router.patch("/conversations/{conversation_id}")
+def update_conversation(
+    conversation_id: UUID,
+    body: UpdateConversationBody,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    conv = db.query(DBConversation).filter(DBConversation.conversation_id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    _ensure_admin(db, conv, current_user.user_id)
+
+    if body.title is not None:
+        title = body.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="Title can't be empty")
+        if len(title) > 120:
+            raise HTTPException(status_code=400, detail="Title is too long")
+        conv.title = title
+
+    if body.image_url is not None:
+        # Empty string clears the photo; otherwise overwrite.
+        conv.image_url = body.image_url.strip() or None
+
+    db.commit()
+    db.refresh(conv)
+    return _serialize_conversation(conv, db, current_user.user_id)
+
+
+@router.post("/conversations/{conversation_id}/members")
+def add_members(
+    conversation_id: UUID,
+    body: AddMembersBody,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    conv = db.query(DBConversation).filter(DBConversation.conversation_id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    _ensure_admin(db, conv, current_user.user_id)
+
+    if not body.member_ids:
+        return _serialize_conversation(conv, db, current_user.user_id)
+
+    existing_ids = {
+        m.user_id for m in db.query(DBConversationMember.user_id)
+        .filter(DBConversationMember.conversation_id == conversation_id).all()
+    }
+    requested = set(body.member_ids)
+    new_ids = [uid for uid in requested if uid not in existing_ids]
+
+    # Reject anyone who's been banned from this conversation. Admins must lift
+    # the ban first via DELETE /conversations/{id}/bans/{user_id}.
+    if new_ids:
+        banned_ids = {
+            b.user_id for b in db.query(DBConversationBan.user_id).filter(
+                DBConversationBan.conversation_id == conversation_id,
+                DBConversationBan.user_id.in_(new_ids),
+            ).all()
+        }
+        new_ids = [uid for uid in new_ids if uid not in banned_ids]
+
+    if new_ids:
+        valid_users = {
+            u.user_id for u in db.query(DBUser.user_id).filter(DBUser.user_id.in_(new_ids)).all()
+        }
+        for uid in new_ids:
+            if uid not in valid_users:
+                continue
+            db.add(DBConversationMember(conversation_id=conversation_id, user_id=uid))
+        db.commit()
+        db.refresh(conv)
+
+    return _serialize_conversation(conv, db, current_user.user_id)
+
+
+@router.delete("/conversations/{conversation_id}/members/{user_id}")
+def remove_member(
+    conversation_id: UUID,
+    user_id: UUID,
+    ban: bool = Query(False, description="Admin-only: also add the user to the ban list so they can't be re-added without lifting the ban."),
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Self-leave OR admin-kick. The last admin can't leave without promoting another first.
+
+    Pass ?ban=true (admin only) to additionally ban the user from re-joining.
+    """
+    conv = db.query(DBConversation).filter(DBConversation.conversation_id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conv.kind == "direct":
+        raise HTTPException(status_code=400, detail="Direct chats can't have members removed")
+
+    target = db.query(DBConversationMember).filter_by(
+        conversation_id=conversation_id, user_id=user_id
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User isn't in this conversation")
+
+    is_self = user_id == current_user.user_id
+    if not is_self:
+        _ensure_admin(db, conv, current_user.user_id)
+
+    if ban and is_self:
+        raise HTTPException(status_code=400, detail="You can't ban yourself")
+    if ban and not is_self:
+        # Already verified admin above for the non-self path.
+        pass
+
+    if conv.kind == "group" and target.is_admin:
+        other_admins = db.query(func.count(DBConversationMember.user_id)).filter(
+            DBConversationMember.conversation_id == conversation_id,
+            DBConversationMember.is_admin.is_(True),
+            DBConversationMember.user_id != user_id,
+        ).scalar() or 0
+        if other_admins == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Promote another admin before removing the last admin",
+            )
+
+    db.delete(target)
+    if ban:
+        # Upsert: ignore if a ban row already exists.
+        existing_ban = db.query(DBConversationBan).filter_by(
+            conversation_id=conversation_id, user_id=user_id,
+        ).first()
+        if not existing_ban:
+            db.add(DBConversationBan(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                banned_by=current_user.user_id,
+            ))
+    db.commit()
+    return {"status": "removed", "banned": ban}
+
+
+@router.get("/conversations/{conversation_id}/bans")
+def list_bans(
+    conversation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Admin-only: list users currently banned from this conversation."""
+    conv = db.query(DBConversation).filter(DBConversation.conversation_id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    _ensure_admin(db, conv, current_user.user_id)
+
+    rows = db.query(DBConversationBan).filter_by(conversation_id=conversation_id).all()
+    user_map = _bulk_user_map(db, [r.user_id for r in rows])
+    return {
+        "bans": [
+            {
+                **_user_summary(user_map.get(r.user_id)),
+                "banned_at": r.banned_at.isoformat() if r.banned_at else None,
+                "banned_by": str(r.banned_by) if r.banned_by else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.delete("/conversations/{conversation_id}/bans/{user_id}")
+def lift_ban(
+    conversation_id: UUID,
+    user_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Admin-only: lift a ban so the user can be re-added."""
+    conv = db.query(DBConversation).filter(DBConversation.conversation_id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    _ensure_admin(db, conv, current_user.user_id)
+
+    row = db.query(DBConversationBan).filter_by(
+        conversation_id=conversation_id, user_id=user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="No active ban for this user")
+    db.delete(row)
+    db.commit()
+    return {"status": "lifted"}
+
+
+@router.patch("/conversations/{conversation_id}/members/{user_id}")
+def update_member(
+    conversation_id: UUID,
+    user_id: UUID,
+    body: UpdateMemberBody,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Promote or demote a member. Admin only. Last admin can't demote themselves."""
+    conv = db.query(DBConversation).filter(DBConversation.conversation_id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    _ensure_admin(db, conv, current_user.user_id)
+
+    target = db.query(DBConversationMember).filter_by(
+        conversation_id=conversation_id, user_id=user_id
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User isn't in this conversation")
+
+    if not body.is_admin and target.is_admin:
+        other_admins = db.query(func.count(DBConversationMember.user_id)).filter(
+            DBConversationMember.conversation_id == conversation_id,
+            DBConversationMember.is_admin.is_(True),
+            DBConversationMember.user_id != user_id,
+        ).scalar() or 0
+        if other_admins == 0:
+            raise HTTPException(status_code=400, detail="Promote another admin first")
+
+    target.is_admin = bool(body.is_admin)
+    db.commit()
+    return {"status": "ok", "is_admin": target.is_admin}
 
 
 @router.post("/event/{event_id}/open")
@@ -285,20 +741,26 @@ def open_event_chat(
         conv = DBConversation(kind="event", event_id=event_id, title=event.title, created_by=event.organizer_id)
         db.add(conv)
         db.flush()
-        # Seed the member list with every current participant
         participants = db.query(DBEventParticipant).filter_by(event_id=event_id).all()
         seen = set()
         for p in participants:
             if p.user_id in seen:
                 continue
-            db.add(DBConversationMember(conversation_id=conv.conversation_id, user_id=p.user_id))
+            db.add(DBConversationMember(
+                conversation_id=conv.conversation_id,
+                user_id=p.user_id,
+                is_admin=(p.user_id == event.organizer_id),
+            ))
             seen.add(p.user_id)
         if event.organizer_id and event.organizer_id not in seen:
-            db.add(DBConversationMember(conversation_id=conv.conversation_id, user_id=event.organizer_id))
+            db.add(DBConversationMember(
+                conversation_id=conv.conversation_id,
+                user_id=event.organizer_id,
+                is_admin=True,
+            ))
         db.commit()
         db.refresh(conv)
     else:
-        # Make sure current user is added (e.g. they joined after chat was made)
         existing = db.query(DBConversationMember).filter_by(
             conversation_id=conv.conversation_id, user_id=current_user.user_id
         ).first()
@@ -316,22 +778,54 @@ def list_messages(
     conversation_id: UUID,
     limit: int = Query(50, ge=1, le=200),
     before: Optional[datetime] = Query(None),
+    since: Optional[datetime] = Query(
+        None,
+        description="Return only messages strictly newer than this timestamp. "
+                    "Use for incremental polling — much smaller payload than full refetch.",
+    ),
     db: Session = Depends(get_db),
     current_user: DBUser = Depends(get_current_user),
 ):
     member = _ensure_member(db, conversation_id, current_user.user_id)
 
     q = db.query(DBMessage).filter(DBMessage.conversation_id == conversation_id)
-    if before:
-        q = q.filter(DBMessage.created_at < before)
-    msgs = q.order_by(DBMessage.created_at.desc()).limit(limit).all()
-    msgs.reverse()  # chronological
+    # message_id is the deterministic tiebreaker when two messages share a
+    # created_at (sub-second collisions on SQLite, batched inserts on Postgres).
+    if since is not None:
+        msgs = (q.filter(DBMessage.created_at > since)
+                  .order_by(DBMessage.created_at.asc(), DBMessage.message_id.asc())
+                  .limit(limit).all())
+    else:
+        if before:
+            q = q.filter(DBMessage.created_at < before)
+        msgs = (q.order_by(DBMessage.created_at.desc(), DBMessage.message_id.desc())
+                  .limit(limit).all())
+        msgs.reverse()  # chronological
 
-    # Bump read marker
     member.last_read_at = datetime.now(timezone.utc)
     db.commit()
 
-    return {"messages": [_serialize_message(m, db) for m in msgs]}
+    if not msgs:
+        return {"messages": []}
+
+    sender_ids = {m.sender_id for m in msgs}
+    users = _bulk_user_map(db, sender_ids)
+
+    shared_post_ids = {m.shared_post_id for m in msgs if m.shared_post_id}
+    shared_event_ids = {m.shared_event_id for m in msgs if m.shared_event_id}
+    posts: Dict[UUID, DBPost] = {}
+    events: Dict[UUID, DBEvent] = {}
+    if shared_post_ids:
+        for p in db.query(DBPost).filter(DBPost.post_id.in_(shared_post_ids)).all():
+            posts[p.post_id] = p
+    if shared_event_ids:
+        for e in db.query(DBEvent).filter(DBEvent.event_id.in_(shared_event_ids)).all():
+            events[e.event_id] = e
+    post_authors = _bulk_user_map(db, {p.author_id for p in posts.values()})
+
+    return {"messages": [
+        _serialize_message_with_users(m, users, posts, events, post_authors) for m in msgs
+    ]}
 
 
 @router.post("/conversations/{conversation_id}/messages")
@@ -352,6 +846,10 @@ def send_message(
     if body.body and len(body.body) > 2000:
         raise HTTPException(status_code=400, detail="Message is too long")
 
+    # Set created_at from Python so we get microsecond precision (SQLite's
+    # server-side CURRENT_TIMESTAMP only has second resolution and would tie
+    # messages sent in rapid succession, breaking ordering and ?since= polling).
+    now = datetime.now(timezone.utc)
     msg = DBMessage(
         conversation_id = conversation_id,
         sender_id       = current_user.user_id,
@@ -360,14 +858,14 @@ def send_message(
         shared_post_id  = body.shared_post_id,
         shared_event_id = body.shared_event_id,
         image_url       = body.image_url,
+        created_at      = now,
     )
     db.add(msg)
 
     conv = db.query(DBConversation).filter(DBConversation.conversation_id == conversation_id).first()
     if conv:
-        conv.last_message_at = datetime.now(timezone.utc)
+        conv.last_message_at = now
 
-    # Bump the sender's own read marker — they've "read" their own message
     sender_member = db.query(DBConversationMember).filter_by(
         conversation_id=conversation_id, user_id=current_user.user_id
     ).first()
@@ -377,7 +875,6 @@ def send_message(
     db.commit()
     db.refresh(msg)
 
-    # Fire-and-forget push to every other member
     try:
         from notifications import send_push
         preview = (body.body or {
@@ -399,10 +896,37 @@ def send_message(
                 data={"conversation_id": str(conversation_id), "type": "new_message"},
             )
     except Exception:
-        # Push is best-effort; never block the send
         pass
 
     return _serialize_message(msg, db)
+
+
+@router.delete("/conversations/{conversation_id}/messages/{message_id}")
+def delete_message(
+    conversation_id: UUID,
+    message_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Sender OR a group/event admin can delete a message."""
+    msg = db.query(DBMessage).filter(
+        DBMessage.message_id == message_id,
+        DBMessage.conversation_id == conversation_id,
+    ).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    is_sender = msg.sender_id == current_user.user_id
+    if not is_sender:
+        conv = db.query(DBConversation).filter(DBConversation.conversation_id == conversation_id).first()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        # _ensure_admin handles event/group/direct correctly
+        _ensure_admin(db, conv, current_user.user_id)
+
+    db.delete(msg)
+    db.commit()
+    return {"status": "deleted"}
 
 
 @router.post("/conversations/{conversation_id}/read")
@@ -417,6 +941,32 @@ def mark_read(
     return {"status": "read"}
 
 
+@router.get("/conversations/{conversation_id}/read-receipts")
+def conversation_read_receipts(
+    conversation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Per-member read state for a conversation, used to render read receipts.
+
+    Returns the timestamp each OTHER member last read up to. Clients render this
+    as: members whose last_read_at >= a given message's created_at have seen it.
+    """
+    _ensure_member(db, conversation_id, current_user.user_id)
+    members = db.query(DBConversationMember).filter_by(conversation_id=conversation_id).all()
+    others = [m for m in members if m.user_id != current_user.user_id]
+    user_map = _bulk_user_map(db, [m.user_id for m in others])
+    return {
+        "members": [
+            {
+                **_user_summary(user_map.get(m.user_id)),
+                "last_read_at": m.last_read_at.isoformat() if m.last_read_at else None,
+            }
+            for m in others
+        ],
+    }
+
+
 @router.get("/unread-summary")
 def unread_summary(
     db: Session = Depends(get_db),
@@ -426,15 +976,95 @@ def unread_summary(
     members = db.query(DBConversationMember).filter(
         DBConversationMember.user_id == current_user.user_id
     ).all()
+    if not members:
+        return {"unread": 0}
     total = 0
     for m in members:
         total += (
-            db.query(DBMessage)
+            db.query(func.count(DBMessage.message_id))
             .filter(
                 DBMessage.conversation_id == m.conversation_id,
                 DBMessage.created_at > m.last_read_at,
                 DBMessage.sender_id != current_user.user_id,
             )
-            .count()
+            .scalar() or 0
         )
     return {"unread": total}
+
+
+# ── Notification feed (powers the in-app top banner) ─────────────────────────
+
+@router.get("/notifications/summary")
+def notifications_summary(
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """One-shot endpoint for the top-of-screen banner.
+
+    Returns the data needed to show: unread DM count, pending friend requests,
+    and the next upcoming event (within the next 48h) the user is part of.
+    Cheap enough to poll every 20–30s.
+    """
+    # Unread messages.
+    members = db.query(DBConversationMember).filter(
+        DBConversationMember.user_id == current_user.user_id
+    ).all()
+    unread = 0
+    for m in members:
+        unread += (
+            db.query(func.count(DBMessage.message_id))
+            .filter(
+                DBMessage.conversation_id == m.conversation_id,
+                DBMessage.created_at > m.last_read_at,
+                DBMessage.sender_id != current_user.user_id,
+            )
+            .scalar() or 0
+        )
+
+    # Pending incoming friend requests.
+    incoming = db.query(func.count(DBFriendship.requester_id)).filter(
+        DBFriendship.status == "pending",
+        DBFriendship.addressee_id == current_user.user_id,
+    ).scalar() or 0
+
+    # Next upcoming event the user joined or is hosting (next 48h).
+    now = datetime.now(timezone.utc)
+    horizon = (now + timedelta(hours=48)).date()
+    today = now.date()
+
+    organizer_q = db.query(DBEvent).filter(
+        DBEvent.organizer_id == current_user.user_id,
+        DBEvent.status == "active",
+        DBEvent.start_date >= today,
+        DBEvent.start_date <= horizon,
+    )
+    participant_q = (
+        db.query(DBEvent)
+        .join(DBEventParticipant, DBEvent.event_id == DBEventParticipant.event_id)
+        .filter(
+            DBEventParticipant.user_id == current_user.user_id,
+            DBEvent.status == "active",
+            DBEvent.start_date >= today,
+            DBEvent.start_date <= horizon,
+        )
+    )
+    candidates = list({e.event_id: e for e in (organizer_q.all() + participant_q.all())}.values())
+    candidates.sort(key=lambda e: (e.start_date, e.start_time or datetime.min.time()))
+    next_event = candidates[0] if candidates else None
+
+    next_event_payload = None
+    if next_event:
+        next_event_payload = {
+            "event_id":   str(next_event.event_id),
+            "title":      next_event.title,
+            "sport":      next_event.sport,
+            "start_date": str(next_event.start_date) if next_event.start_date else None,
+            "start_time": str(next_event.start_time) if next_event.start_time else None,
+            "location":   next_event.location,
+        }
+
+    return {
+        "unread_messages":     unread,
+        "pending_friend_requests": incoming,
+        "next_event":          next_event_payload,
+    }

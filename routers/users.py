@@ -56,6 +56,7 @@ ALLOWED_IMAGE_PREFIXES = [
     'data:image/jpeg;base64,', 'data:image/png;base64,',
     'data:image/webp;base64,', 'data:image/gif;base64,',
     'data:image/jpg;base64,',
+    'data:image/heic;base64,', 'data:image/heif;base64,',
 ]
 
 
@@ -64,7 +65,7 @@ def validate_image(value: str) -> None:
     if not value or value == 'null':
         return
     if not any(value.startswith(p) for p in ALLOWED_IMAGE_PREFIXES):
-        raise HTTPException(status_code=400, detail="Invalid image format. Use JPEG, PNG, or WebP.")
+        raise HTTPException(status_code=400, detail="Invalid image format. Use JPEG, PNG, HEIC, WebP, or GIF.")
     try:
         raw = base64.b64decode(value.split(',', 1)[1])
     except Exception:
@@ -294,7 +295,12 @@ def update_me(updates: UserUpdate, current_user: DBUser = Depends(get_current_us
 
 # ── Avatar / Banner Upload (multipart, S3-backed when configured) ────────────
 
-ALLOWED_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+ALLOWED_IMAGE_CONTENT_TYPES = {
+    "image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif",
+    # iPhone defaults — they reach the server as image/heic / image/heif
+    # because expo-image-picker doesn't always transcode on iOS.
+    "image/heic", "image/heif",
+}
 
 
 @router.post("/users/me/avatar")

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, String, ForeignKey, Uuid
+from sqlalchemy import Boolean, Column, DateTime, String, ForeignKey, Uuid
 from sqlalchemy.sql import func
 import uuid
 from database import Base
@@ -14,6 +14,7 @@ class DBConversation(Base):
     conversation_id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     kind            = Column(String(16), nullable=False, default="direct")  # direct | group | event
     title           = Column(String(120), nullable=True)
+    image_url       = Column(String(512), nullable=True)
     event_id        = Column(Uuid(as_uuid=True), ForeignKey("events.event_id"), nullable=True, index=True)
     created_by      = Column(Uuid(as_uuid=True), ForeignKey("users.user_id"), nullable=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
@@ -21,10 +22,16 @@ class DBConversation(Base):
 
 
 class DBConversationMember(Base):
-    """A user's membership in a conversation. Tracks last read timestamp for unread counts."""
+    """A user's membership in a conversation. Tracks last read timestamp for unread counts.
+
+    `is_admin` only carries meaning for `kind='group'` conversations — it gates
+    add/remove/rename/promote actions. Direct chats ignore it; event chats are
+    moderated by the event organizer at the application layer.
+    """
     __tablename__ = "conversation_members"
 
     conversation_id = Column(Uuid(as_uuid=True), ForeignKey("conversations.conversation_id", ondelete="CASCADE"), primary_key=True)
     user_id         = Column(Uuid(as_uuid=True), ForeignKey("users.user_id"), primary_key=True)
     joined_at       = Column(DateTime(timezone=True), server_default=func.now())
     last_read_at    = Column(DateTime(timezone=True), server_default=func.now())
+    is_admin        = Column(Boolean, nullable=False, server_default="false", default=False)

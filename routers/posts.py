@@ -29,10 +29,15 @@ from models.db_comment_reaction import DBCommentLike
 from models.db_block import DBBlock
 
 ALLOWED_POST_CONTENT_TYPES = {
-    "image/jpeg", "image/png", "image/webp", "image/gif",
-    "video/mp4", "video/quicktime",
+    # Images — includes HEIC/HEIF (iPhone default) and common formats from
+    # both iOS and Android.
+    "image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif",
+    "image/heic", "image/heif",
+    # Videos — limited to short clips (30s) enforced client-side; the
+    # file-size cap here is the server-side safety net.
+    "video/mp4", "video/quicktime", "video/x-m4v",
 }
-MAX_POST_MEDIA_MB = 25
+MAX_POST_MEDIA_MB = 50
 
 
 router = APIRouter(prefix="/feed", tags=["feed"])

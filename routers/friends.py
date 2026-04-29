@@ -39,6 +39,7 @@ def _user_summary(u: Optional[DBUser]) -> dict:
         "avatar_photo": u.avatar_photo,
         "avatar_config":u.avatar_config,
         "bio":          u.bio,
+        "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
     }
 
 
@@ -201,6 +202,75 @@ def pending_requests(
     return {
         "incoming": [serialize(r, r.requester_id) for r in incoming_rows],
         "outgoing": [serialize(r, r.addressee_id) for r in outgoing_rows],
+    }
+
+
+def _accepted_friend_ids(db: Session, user_id: UUID) -> set[UUID]:
+    """All other-user-ids in `accepted` friendships involving user_id."""
+    rows = db.query(DBFriendship).filter(
+        DBFriendship.status == "accepted",
+        or_(
+            DBFriendship.requester_id == user_id,
+            DBFriendship.addressee_id == user_id,
+        ),
+    ).all()
+    out: set[UUID] = set()
+    for r in rows:
+        out.add(r.addressee_id if r.requester_id == user_id else r.requester_id)
+    return out
+
+
+@router.get("/of/{user_id}")
+def friends_of(
+    user_id: UUID,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Friends list for a profile page.
+
+    Always returns the target's friends. Also returns `mutuals` — the subset
+    that the current viewer is also friends with — and `mutual_count` for
+    rendering "X friends in common" on someone else's profile. When viewing
+    your own profile, mutuals is empty by design.
+    """
+    target = db.query(DBUser).filter(DBUser.user_id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if _blocked_between(db, current_user.user_id, user_id):
+        # Don't leak the friend list of someone you've blocked / blocked you.
+        return {"friends": [], "count": 0, "mutuals": [], "mutual_count": 0}
+
+    target_friend_ids = _accepted_friend_ids(db, user_id)
+    is_self = user_id == current_user.user_id
+
+    if not is_self:
+        my_friend_ids = _accepted_friend_ids(db, current_user.user_id)
+        mutual_ids = target_friend_ids & my_friend_ids
+    else:
+        mutual_ids = set()
+
+    if not target_friend_ids:
+        return {"friends": [], "count": 0, "mutuals": [], "mutual_count": 0}
+
+    users = db.query(DBUser).filter(DBUser.user_id.in_(list(target_friend_ids))).all()
+    by_id = {u.user_id: u for u in users}
+
+    # Surface mutuals first; cap to `limit` for big rosters.
+    ordered_ids = list(mutual_ids) + [uid for uid in target_friend_ids if uid not in mutual_ids]
+    serialized = []
+    for uid in ordered_ids[:limit]:
+        u = by_id.get(uid)
+        if not u:
+            continue
+        serialized.append({**_user_summary(u), "is_mutual": uid in mutual_ids})
+
+    return {
+        "friends":      serialized,
+        "count":        len(target_friend_ids),
+        "mutuals":      [s for s in serialized if s["is_mutual"]],
+        "mutual_count": len(mutual_ids),
     }
 
 

@@ -85,6 +85,30 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         raise credentials_exception
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is deactivated")
+
+    # Bump last_seen_at at most once per minute. We do this in a separate
+    # short-lived session so committing here doesn't expire the `user`
+    # attributes loaded by the request's session — endpoints like /users/me
+    # return `current_user` directly and need its fields intact.
+    try:
+        now = datetime.now(timezone.utc)
+        last = user.last_seen_at
+        if last is None or (now - last).total_seconds() > 60:
+            from sqlalchemy import update as _sa_update
+            from database import SessionLocal
+            with SessionLocal() as touch_db:
+                touch_db.execute(
+                    _sa_update(DBUser)
+                    .where(DBUser.user_id == user.user_id)
+                    .values(last_seen_at=now)
+                )
+                touch_db.commit()
+            # Mirror onto the in-memory object so the rest of this request
+            # sees fresh data without a re-fetch.
+            user.last_seen_at = now
+    except Exception:
+        pass
+
     return user
 
 

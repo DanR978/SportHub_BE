@@ -12,5 +12,6 @@ from models.db_post_reaction import DBPostReaction
 from models.db_comment import DBComment
 from models.db_comment_reaction import DBCommentLike
 from models.db_conversation import DBConversation, DBConversationMember
+from models.db_conversation_ban import DBConversationBan
 from models.db_message import DBMessage
 from models.db_friendship import DBFriendship

@@ -27,3 +27,4 @@ class DBUser(Base):
     reset_token        = Column(String(10), nullable=True)
     reset_token_expiry = Column(DateTime, nullable=True)
     terms_accepted_at  = Column(DateTime(timezone=True), nullable=True)
+    last_seen_at       = Column(DateTime(timezone=True), nullable=True, index=True)
