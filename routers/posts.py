@@ -36,6 +36,10 @@ ALLOWED_POST_CONTENT_TYPES = {
     # Videos — limited to short clips (30s) enforced client-side; the
     # file-size cap here is the server-side safety net.
     "video/mp4", "video/quicktime", "video/x-m4v",
+    # Audio — voice messages from chat. m4a (AAC) is what expo-audio writes
+    # by default on iOS; aac/mp3/webm/wav cover Android + future use cases.
+    "audio/m4a", "audio/mp4", "audio/aac", "audio/mpeg", "audio/wav",
+    "audio/x-m4a", "audio/webm",
 }
 MAX_POST_MEDIA_MB = 50
 
