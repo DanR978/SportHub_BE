@@ -59,6 +59,10 @@ class SendMessageBody(BaseModel):
     shared_post_id: Optional[UUID] = None
     shared_event_id: Optional[UUID] = None
     image_url: Optional[str] = None
+    # For voice / gif kinds. media_url holds the audio or gif URL; for
+    # voice messages, voice_duration_seconds carries the clip length.
+    media_url: Optional[str] = None
+    voice_duration_seconds: Optional[float] = None
 
 
 class AddMembersBody(BaseModel):
@@ -72,6 +76,14 @@ class UpdateMemberBody(BaseModel):
 class UpdateConversationBody(BaseModel):
     title: Optional[str] = None
     image_url: Optional[str] = None
+
+
+class UpdateNicknameBody(BaseModel):
+    nickname: Optional[str] = None  # empty / None clears it
+
+
+class UpdateChatThemeBody(BaseModel):
+    chat_theme: Optional[str] = None  # empty / None clears it
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -172,6 +184,8 @@ def _serialize_message_with_users(m: DBMessage, users: Dict[UUID, DBUser],
         "kind":            m.kind,
         "body":            m.body,
         "image_url":       m.image_url,
+        "media_url":       m.media_url,
+        "voice_duration_seconds": m.voice_duration_seconds,
         "created_at":      m.created_at.isoformat() if m.created_at else None,
     }
     if m.shared_post_id and posts and m.shared_post_id in posts:
@@ -264,7 +278,14 @@ def _list_conversations_payload(db: Session, viewer_id: UUID, include_archived: 
     """
     invisible = _invisible_user_ids(db, viewer_id)
     q = (
-        db.query(DBConversation, DBConversationMember.archived_at, DBConversationMember.favorited_at)
+        db.query(
+            DBConversation,
+            DBConversationMember.archived_at,
+            DBConversationMember.favorited_at,
+            DBConversationMember.muted_at,
+            DBConversationMember.nickname,
+            DBConversationMember.chat_theme,
+        )
         .join(DBConversationMember, DBConversation.conversation_id == DBConversationMember.conversation_id)
         .filter(DBConversationMember.user_id == viewer_id)
     )
@@ -274,8 +295,11 @@ def _list_conversations_payload(db: Session, viewer_id: UUID, include_archived: 
     if not rows:
         return []
     convs = [r[0] for r in rows]
-    archived_by_conv = {r[0].conversation_id: r[1] for r in rows}
+    archived_by_conv  = {r[0].conversation_id: r[1] for r in rows}
     favorited_by_conv = {r[0].conversation_id: r[2] for r in rows}
+    muted_by_conv     = {r[0].conversation_id: r[3] for r in rows}
+    nickname_by_conv  = {r[0].conversation_id: r[4] for r in rows}
+    theme_by_conv     = {r[0].conversation_id: r[5] for r in rows}
     # Favorites pinned to top, both groups still in last_message_at desc order.
     convs.sort(key=lambda c: (
         0 if favorited_by_conv.get(c.conversation_id) else 1,
@@ -374,8 +398,12 @@ def _list_conversations_payload(db: Session, viewer_id: UUID, include_archived: 
             )
             member_payload.append({**base, "is_admin": is_admin})
 
+        # Per-viewer nickname overrides the DM title (private to this user).
+        viewer_nickname = nickname_by_conv.get(conv.conversation_id)
         title = conv.title
-        if not title:
+        if conv.kind == "direct" and viewer_nickname:
+            title = viewer_nickname
+        elif not title:
             if conv.kind == "direct":
                 other = next((m for m in member_payload if m["user_id"] != str(viewer_id)), None)
                 title = other["name"] if other else "Direct message"
@@ -407,6 +435,9 @@ def _list_conversations_payload(db: Session, viewer_id: UUID, include_archived: 
             "read_state":      _read_state_for(db, conv.conversation_id, viewer_id, members),
             "is_favorited":    favorited_by_conv.get(conv.conversation_id) is not None,
             "is_archived":     archived_by_conv.get(conv.conversation_id) is not None,
+            "is_muted":        muted_by_conv.get(conv.conversation_id) is not None,
+            "nickname":        viewer_nickname,
+            "chat_theme":      theme_by_conv.get(conv.conversation_id),
         })
     return out
 
@@ -450,8 +481,16 @@ def _serialize_conversation(conv: DBConversation, db: Session, viewer_id: UUID) 
             .scalar() or 0
         )
 
+    # Per-viewer personalization for this conv.
+    my_member = next((m for m in members if m.user_id == viewer_id), None)
+    viewer_nickname = getattr(my_member, "nickname", None) if my_member else None
+    viewer_theme    = getattr(my_member, "chat_theme", None) if my_member else None
+    viewer_muted    = bool(getattr(my_member, "muted_at", None)) if my_member else False
+
     title = conv.title
-    if not title:
+    if conv.kind == "direct" and viewer_nickname:
+        title = viewer_nickname
+    elif not title:
         if conv.kind == "direct":
             other = next((u for u in member_payload if u["user_id"] != str(viewer_id)), None)
             title = other["name"] if other else "Direct message"
@@ -473,6 +512,9 @@ def _serialize_conversation(conv: DBConversation, db: Session, viewer_id: UUID) 
         "unread_count":    unread,
         "last_message":    _serialize_message(last_msg, db, viewer_id) if last_msg else None,
         "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
+        "is_muted":        viewer_muted,
+        "nickname":        viewer_nickname,
+        "chat_theme":      viewer_theme,
     }
 
 
@@ -913,13 +955,19 @@ def send_message(
     _ensure_member(db, conversation_id, current_user.user_id)
 
     kind = (body.kind or "text").strip()
-    if kind not in ("text", "post_share", "event_share", "image"):
+    if kind not in ("text", "post_share", "event_share", "image", "voice", "gif"):
         raise HTTPException(status_code=400, detail="Unknown message kind")
 
     if kind == "text" and (not body.body or not body.body.strip()):
         raise HTTPException(status_code=400, detail="Message body required")
     if body.body and len(body.body) > 2000:
         raise HTTPException(status_code=400, detail="Message is too long")
+    if kind == "image" and not body.image_url:
+        raise HTTPException(status_code=400, detail="image_url required for image messages")
+    if kind == "voice" and not (body.media_url or body.image_url):
+        raise HTTPException(status_code=400, detail="media_url required for voice messages")
+    if kind == "gif" and not (body.media_url or body.image_url):
+        raise HTTPException(status_code=400, detail="media_url required for gif messages")
 
     # In a 1:1 DM, refuse delivery if either side has blocked the other.
     # We only enforce on direct chats — group/event chats stay functional but
@@ -950,6 +998,8 @@ def send_message(
         shared_post_id  = body.shared_post_id,
         shared_event_id = body.shared_event_id,
         image_url       = body.image_url,
+        media_url       = body.media_url,
+        voice_duration_seconds = body.voice_duration_seconds,
         created_at      = now,
     )
     db.add(msg)
@@ -981,6 +1031,8 @@ def send_message(
             "post_share":  "shared a post",
             "event_share": "shared an event",
             "image":       "sent a photo",
+            "voice":       "sent a voice message",
+            "gif":         "sent a GIF",
         }.get(kind, "sent a message"))[:140]
         sender_name = f"{current_user.first_name or ''} {current_user.last_name or ''}".strip() or "New message"
         members = db.query(DBConversationMember).filter(
@@ -988,6 +1040,9 @@ def send_message(
             DBConversationMember.user_id != current_user.user_id,
         ).all()
         for m in members:
+            # Honor mute — skip push for anyone who muted this conversation.
+            if m.muted_at is not None:
+                continue
             send_push(
                 db,
                 m.user_id,
@@ -1077,6 +1132,110 @@ def unfavorite_conversation(
     member.favorited_at = None
     db.commit()
     return {"status": "unfavorited"}
+
+
+# ── Mute ────────────────────────────────────────────────────────────────────
+
+@router.post("/conversations/{conversation_id}/mute")
+def mute_conversation(
+    conversation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Suppress push notifications + in-app toasts for this conversation,
+    just for the calling user. Other members are unaffected."""
+    member = _ensure_member(db, conversation_id, current_user.user_id)
+    member.muted_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "muted"}
+
+
+@router.delete("/conversations/{conversation_id}/mute")
+def unmute_conversation(
+    conversation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    member = _ensure_member(db, conversation_id, current_user.user_id)
+    member.muted_at = None
+    db.commit()
+    return {"status": "unmuted"}
+
+
+# ── Nickname (DM only — overrides title for the calling user only) ──────────
+
+@router.patch("/conversations/{conversation_id}/nickname")
+def update_nickname(
+    conversation_id: UUID,
+    body: UpdateNicknameBody,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    member = _ensure_member(db, conversation_id, current_user.user_id)
+    nickname = (body.nickname or "").strip() or None
+    if nickname and len(nickname) > 60:
+        raise HTTPException(status_code=400, detail="Nickname is too long (max 60)")
+    member.nickname = nickname
+    db.commit()
+    return {"status": "ok", "nickname": member.nickname}
+
+
+# ── Chat theme (per-user background — color hex or image URL) ───────────────
+
+@router.patch("/conversations/{conversation_id}/theme")
+def update_chat_theme(
+    conversation_id: UUID,
+    body: UpdateChatThemeBody,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    member = _ensure_member(db, conversation_id, current_user.user_id)
+    theme = (body.chat_theme or "").strip() or None
+    # Cap at 1024 chars — covers any reasonable URL or hex value with slack.
+    if theme and len(theme) > 1024:
+        raise HTTPException(status_code=400, detail="Theme value is too long")
+    member.chat_theme = theme
+    db.commit()
+    return {"status": "ok", "chat_theme": member.chat_theme}
+
+
+# ── Media library (images sent in this conversation) ───────────────────────
+
+@router.get("/conversations/{conversation_id}/media")
+def list_conversation_media(
+    conversation_id: UUID,
+    limit: int = Query(60, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Return the most recent image / gif attachments in a conversation,
+    newest first. Used by the chat info screen's Media grid."""
+    _ensure_member(db, conversation_id, current_user.user_id)
+
+    msgs = (
+        db.query(DBMessage)
+        .filter(
+            DBMessage.conversation_id == conversation_id,
+            DBMessage.kind.in_(("image", "gif")),
+        )
+        .order_by(DBMessage.created_at.desc(), DBMessage.message_id.desc())
+        .limit(limit)
+        .all()
+    )
+
+    out = []
+    for m in msgs:
+        url = m.image_url or m.media_url
+        if not url:
+            continue
+        out.append({
+            "message_id":  str(m.message_id),
+            "kind":        m.kind,
+            "url":         url,
+            "created_at":  m.created_at.isoformat() if m.created_at else None,
+            "sender_id":   str(m.sender_id) if m.sender_id else None,
+        })
+    return {"media": out}
 
 
 @router.post("/conversations/{conversation_id}/read")

@@ -40,3 +40,13 @@ class DBConversationMember(Base):
     # without affecting other members. Favoriting pins it to the top.
     archived_at     = Column(DateTime(timezone=True), nullable=True)
     favorited_at    = Column(DateTime(timezone=True), nullable=True)
+    # Mute: timestamp when this user muted the conversation. Null = unmuted.
+    # Mute suppresses push notifications + the in-app message toast for THIS
+    # member, but the conversation still receives messages and updates unread.
+    muted_at        = Column(DateTime(timezone=True), nullable=True)
+    # Per-user customization. Nickname overrides the OTHER party's display
+    # name in 1:1 DMs; chat_theme is either a hex color (#rrggbb) or an
+    # https URL pointing to a background image. Both are private to this
+    # member — no one else sees them.
+    nickname        = Column(String(60), nullable=True)
+    chat_theme      = Column(Text, nullable=True)

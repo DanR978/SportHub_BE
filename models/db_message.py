@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, String, Text, ForeignKey, Uuid
+from sqlalchemy import Column, DateTime, Float, String, Text, ForeignKey, Uuid
 from sqlalchemy.sql import func
 import uuid
 from database import Base
@@ -6,8 +6,8 @@ from database import Base
 
 class DBMessage(Base):
     """
-    A message inside a conversation. `kind` lets us embed richer shares later
-    ('text' | 'post_share' | 'event_share' | 'image').
+    A message inside a conversation. `kind` discriminates the payload:
+      'text' | 'post_share' | 'event_share' | 'image' | 'voice' | 'gif'
     """
     __tablename__ = "messages"
 
@@ -21,5 +21,10 @@ class DBMessage(Base):
     shared_event_id = Column(Uuid(as_uuid=True), ForeignKey("events.event_id"), nullable=True)
     # TEXT so S3 signed URLs and dev-mode base64 fallbacks both fit.
     image_url       = Column(Text, nullable=True)
+    # For 'voice' and 'gif'. We could've reused image_url but a dedicated
+    # column keeps the meaning self-evident and lets a future feature attach
+    # both an image and a voice clip without overload.
+    media_url       = Column(Text, nullable=True)
+    voice_duration_seconds = Column(Float, nullable=True)
 
     created_at      = Column(DateTime(timezone=True), server_default=func.now(), index=True)

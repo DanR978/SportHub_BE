@@ -899,3 +899,124 @@ class TestBlockedDM:
         assert len(members) == 1
         assert members[0]["blocked"] is True
         assert members[0]["name"] == "Blocked user"
+
+
+# ── Mute / Nickname / Theme ──────────────────────────────────────────────────
+
+class TestChatPersonalization:
+    def test_mute_unmute(self, client, user, other_user, auth_headers):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        r = client.post(f"/messaging/conversations/{conv['conversation_id']}/mute",
+                        headers=auth_headers)
+        assert r.status_code == 200
+        # Reflected in conv list.
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        match = next(c for c in r.json()["conversations"] if c["conversation_id"] == conv["conversation_id"])
+        assert match["is_muted"] is True
+        # Unmute.
+        r = client.delete(f"/messaging/conversations/{conv['conversation_id']}/mute",
+                          headers=auth_headers)
+        assert r.status_code == 200
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        match = next(c for c in r.json()["conversations"] if c["conversation_id"] == conv["conversation_id"])
+        assert match["is_muted"] is False
+
+    def test_nickname_overrides_dm_title_for_viewer_only(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        r = client.patch(
+            f"/messaging/conversations/{conv['conversation_id']}/nickname",
+            headers=auth_headers, json={"nickname": "Bobby"},
+        )
+        assert r.status_code == 200
+        # Alice sees Bobby.
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        alice_view = next(c for c in r.json()["conversations"] if c["conversation_id"] == conv["conversation_id"])
+        assert alice_view["title"] == "Bobby"
+        assert alice_view["nickname"] == "Bobby"
+        # Bob still sees Alice.
+        r = client.get("/messaging/conversations", headers=other_auth_headers)
+        bob_view = next(c for c in r.json()["conversations"] if c["conversation_id"] == conv["conversation_id"])
+        assert bob_view["title"] != "Bobby"
+        assert bob_view["nickname"] is None
+
+    def test_clear_nickname(self, client, user, other_user, auth_headers):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        client.patch(f"/messaging/conversations/{conv['conversation_id']}/nickname",
+                     headers=auth_headers, json={"nickname": "Bobby"})
+        r = client.patch(
+            f"/messaging/conversations/{conv['conversation_id']}/nickname",
+            headers=auth_headers, json={"nickname": ""},
+        )
+        assert r.status_code == 200
+        assert r.json()["nickname"] is None
+
+    def test_theme_set_and_reflect(self, client, user, other_user, auth_headers):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        r = client.patch(
+            f"/messaging/conversations/{conv['conversation_id']}/theme",
+            headers=auth_headers, json={"chat_theme": "#0ea5e9"},
+        )
+        assert r.status_code == 200
+        assert r.json()["chat_theme"] == "#0ea5e9"
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        match = next(c for c in r.json()["conversations"] if c["conversation_id"] == conv["conversation_id"])
+        assert match["chat_theme"] == "#0ea5e9"
+
+
+# ── Image / voice / GIF kinds + media list ───────────────────────────────────
+
+class TestRichMessageKinds:
+    def test_image_message_requires_url(self, client, user, other_user, auth_headers):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        r = client.post(
+            f"/messaging/conversations/{conv['conversation_id']}/messages",
+            headers=auth_headers, json={"kind": "image"},
+        )
+        assert r.status_code == 400
+
+    def test_voice_message_round_trip(self, client, user, other_user, auth_headers):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        r = client.post(
+            f"/messaging/conversations/{conv['conversation_id']}/messages",
+            headers=auth_headers,
+            json={"kind": "voice", "media_url": "https://cdn/x.m4a", "voice_duration_seconds": 4.2},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["kind"] == "voice"
+        assert r.json()["media_url"] == "https://cdn/x.m4a"
+        assert r.json()["voice_duration_seconds"] == 4.2
+
+    def test_gif_message_requires_url(self, client, user, other_user, auth_headers):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        r = client.post(
+            f"/messaging/conversations/{conv['conversation_id']}/messages",
+            headers=auth_headers, json={"kind": "gif"},
+        )
+        assert r.status_code == 400
+
+    def test_media_endpoint_lists_images_and_gifs_only(
+        self, client, user, other_user, auth_headers,
+    ):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        # text + image + gif + voice
+        _send(client, auth_headers, conv["conversation_id"], "hi")
+        client.post(
+            f"/messaging/conversations/{conv['conversation_id']}/messages",
+            headers=auth_headers, json={"kind": "image", "image_url": "https://cdn/a.jpg"},
+        )
+        client.post(
+            f"/messaging/conversations/{conv['conversation_id']}/messages",
+            headers=auth_headers, json={"kind": "gif", "media_url": "https://cdn/b.gif"},
+        )
+        client.post(
+            f"/messaging/conversations/{conv['conversation_id']}/messages",
+            headers=auth_headers,
+            json={"kind": "voice", "media_url": "https://cdn/c.m4a", "voice_duration_seconds": 1.0},
+        )
+        r = client.get(f"/messaging/conversations/{conv['conversation_id']}/media",
+                       headers=auth_headers)
+        assert r.status_code == 200
+        kinds = [m["kind"] for m in r.json()["media"]]
+        assert set(kinds) == {"image", "gif"}
