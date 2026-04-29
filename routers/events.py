@@ -16,7 +16,7 @@ from models.db_archived_event import DBArchivedEvent
 from auth import get_current_user, SECRET_KEY, ALGORITHM
 from models.db_user import DBUser
 from typing import List, Optional
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from geopy.geocoders import Nominatim
 from better_profanity import profanity
 from geopy.distance import geodesic
@@ -72,7 +72,7 @@ def enrich_event(event, db, current_user_id=None):
 
 # Block helpers live in blocks.py — re-export under the existing names so
 # the rest of this module + any external imports keep working.
-from blocks import get_blocked_ids, invisible_user_ids as get_invisible_ids  # noqa: E402,F401
+from blocks import invisible_user_ids as get_invisible_ids  # noqa: E402
 
 
 def _is_event_banned(db, event_id, user_id) -> bool:
@@ -916,7 +916,6 @@ async def share_preview(event_id: UUID, db: Session = Depends(get_db)):
     participant_count = db.query(DBEventParticipant).filter_by(event_id=event.event_id).count()
     spots_left = max(0, event.max_players - participant_count)
 
-    description = f"{emoji} {sport_cap} · {date_str} · {time_str}\n📍 {event.location}\n👥 {spots_left} spots left"
     cost_str = "Free" if not event.cost or float(event.cost) == 0 else f"${event.cost}"
 
     og_title = f"{event.title} — {sport_cap}"

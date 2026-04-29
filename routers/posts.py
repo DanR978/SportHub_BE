@@ -7,13 +7,11 @@ We store a denormalized `score = like_count - downvote_count` on each post.
 The "hot" feed sorts by score, then recency. The "new" feed is strictly recent.
 A "nearby" feed additionally filters by Haversine radius around the caller.
 """
-from typing import List, Optional
+from typing import Optional
 from uuid import UUID
-from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 from geopy.distance import geodesic
 from better_profanity import profanity

@@ -5,7 +5,7 @@ Rows canonicalize around (requester_id, addressee_id). We don't store a row
 per direction — the accepted state is symmetric and we resolve "friend of"
 queries with an OR across both columns.
 """
-from typing import Optional, List
+from typing import Optional
 from uuid import UUID
 from datetime import datetime, timezone
 

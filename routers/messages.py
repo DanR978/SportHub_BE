@@ -19,7 +19,7 @@ Design notes
 from typing import List, Optional, Iterable, Dict
 from uuid import UUID
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import and_, func, or_, select, tuple_
+from sqlalchemy import func
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field

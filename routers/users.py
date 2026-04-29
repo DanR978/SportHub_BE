@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Header, Request, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel
 from models.db_event_participant import DBEventParticipant
 from schemas.user import User, UserCreate, SocialLoginRequest, UserUpdate
@@ -7,7 +7,7 @@ from models.db_user import DBUser
 from sqlalchemy.orm import Session
 from database import get_db
 from fastapi.security import OAuth2PasswordRequestForm
-from auth import hash_password, verify_password, create_access_token, get_current_user, verify_minimum_age, issue_token_pair, decode_refresh_token
+from auth import hash_password, verify_password, get_current_user, verify_minimum_age, issue_token_pair, decode_refresh_token
 from rate_limiter import limiter
 from better_profanity import profanity
 import httpx
