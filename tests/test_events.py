@@ -124,3 +124,139 @@ def test_delete_event_archives_it(client, auth_headers, db):
     r = client.delete(f"/sports-events/{event_id}", headers=auth_headers)
     assert r.status_code == 200
     assert db.query(DBArchivedEvent).filter(DBArchivedEvent.event_id == event_id).first() is not None
+
+
+# ── Block + event invisibility (both directions) ─────────────────────────────
+
+class TestBlockHidesEvents:
+    def test_blocked_organizer_event_hidden_from_blocker(
+        self, client, db, user, other_user, auth_headers, other_auth_headers,
+    ):
+        # other_user organizes an event.
+        r = client.post("/sports-events", headers=other_auth_headers, json=_event_payload())
+        assert r.status_code == 200
+        event_id = r.json()["event_id"]
+        # alice blocks bob.
+        r = client.post(f"/users/{other_user.user_id}/block", headers=auth_headers)
+        assert r.status_code in (200, 201)
+        # alice's event list should not include bob's event.
+        r = client.get("/sports-events", headers=auth_headers)
+        ids = [e["event_id"] for e in r.json()]
+        assert event_id not in ids
+
+    def test_blocked_user_cannot_see_blockers_event(
+        self, client, db, user, other_user, auth_headers, other_auth_headers,
+    ):
+        # alice creates an event, then blocks bob.
+        r = client.post("/sports-events", headers=auth_headers, json=_event_payload())
+        event_id = r.json()["event_id"]
+        client.post(f"/users/{other_user.user_id}/block", headers=auth_headers)
+        # bob shouldn't see alice's event.
+        r = client.get("/sports-events", headers=other_auth_headers)
+        ids = [e["event_id"] for e in r.json()]
+        assert event_id not in ids
+
+    def test_block_deletes_friendship(
+        self, client, db, user, other_user, auth_headers, other_auth_headers,
+    ):
+        # Become friends first.
+        r = client.post("/friends/request", headers=auth_headers,
+                        json={"user_id": str(other_user.user_id)})
+        assert r.status_code == 200
+        me_a = client.get("/users/me", headers=auth_headers).json()
+        r = client.post(f"/friends/{me_a['user_id']}/accept", headers=other_auth_headers)
+        assert r.status_code == 200
+        # Confirm friendship.
+        r = client.get("/friends", headers=auth_headers)
+        assert any(f["user_id"] == str(other_user.user_id) for f in r.json()["friends"])
+        # Block.
+        client.post(f"/users/{other_user.user_id}/block", headers=auth_headers)
+        # Friendship gone.
+        r = client.get("/friends", headers=auth_headers)
+        assert not any(f["user_id"] == str(other_user.user_id) for f in r.json()["friends"])
+        # Unblock should NOT auto-restore — Alice has to send a fresh request.
+        client.delete(f"/users/{other_user.user_id}/block", headers=auth_headers)
+        r = client.get("/friends", headers=auth_headers)
+        assert not any(f["user_id"] == str(other_user.user_id) for f in r.json()["friends"])
+
+
+# ── Organizer kick + ban ─────────────────────────────────────────────────────
+
+class TestOrganizerKick:
+    def _join(self, client, headers, event_id):
+        r = client.post(f"/sports-events/{event_id}/join", headers=headers)
+        assert r.status_code == 200, r.text
+
+    def test_organizer_can_kick_participant(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        r = client.post("/sports-events", headers=auth_headers, json=_event_payload())
+        event_id = r.json()["event_id"]
+        self._join(client, other_auth_headers, event_id)
+
+        r = client.delete(
+            f"/sports-events/{event_id}/participants/{other_user.user_id}",
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+        # Bob is no longer a participant.
+        r = client.get(f"/sports-events/{event_id}/participants", headers=auth_headers)
+        ids = [p["user_id"] for p in r.json()["participants"]]
+        assert str(other_user.user_id) not in ids
+
+    def test_kick_with_ban_blocks_rejoin(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        r = client.post("/sports-events", headers=auth_headers, json=_event_payload())
+        event_id = r.json()["event_id"]
+        self._join(client, other_auth_headers, event_id)
+
+        r = client.delete(
+            f"/sports-events/{event_id}/participants/{other_user.user_id}?ban=true",
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+        assert r.json().get("banned") is True
+
+        # Bob tries to re-join — should 403.
+        r = client.post(f"/sports-events/{event_id}/join", headers=other_auth_headers)
+        assert r.status_code == 403
+
+    def test_lift_event_ban_allows_rejoin(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        r = client.post("/sports-events", headers=auth_headers, json=_event_payload())
+        event_id = r.json()["event_id"]
+        self._join(client, other_auth_headers, event_id)
+        client.delete(
+            f"/sports-events/{event_id}/participants/{other_user.user_id}?ban=true",
+            headers=auth_headers,
+        )
+        r = client.delete(f"/sports-events/{event_id}/bans/{other_user.user_id}",
+                          headers=auth_headers)
+        assert r.status_code == 200
+
+        r = client.post(f"/sports-events/{event_id}/join", headers=other_auth_headers)
+        assert r.status_code == 200
+
+    def test_non_organizer_cannot_kick(
+        self, client, db, user, other_user, auth_headers, other_auth_headers,
+    ):
+        from auth import hash_password, issue_token_pair
+        from models.db_user import DBUser
+        carol = DBUser(
+            email="carolkick@example.com", first_name="Carol", last_name="K",
+            hashed_password=hash_password("p"),
+        )
+        db.add(carol); db.commit(); db.refresh(carol)
+        carol_h = {"Authorization": f"Bearer {issue_token_pair(carol.email)['access_token']}"}
+
+        r = client.post("/sports-events", headers=auth_headers, json=_event_payload())
+        event_id = r.json()["event_id"]
+        self._join(client, other_auth_headers, event_id)
+        # Carol is not the organizer — she can't kick Bob.
+        r = client.delete(
+            f"/sports-events/{event_id}/participants/{other_user.user_id}",
+            headers=carol_h,
+        )
+        assert r.status_code == 403

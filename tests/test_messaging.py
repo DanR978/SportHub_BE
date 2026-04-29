@@ -819,3 +819,18 @@ class TestArchiveFavorite:
         ids = [c["conversation_id"] for c in r.json()["conversations"]]
         assert ids[0] == dm1["conversation_id"]
 
+    def test_new_message_unarchives_conversation(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        # Alice archives.
+        r = client.post(f"/messaging/conversations/{conv['conversation_id']}/archive",
+                        headers=auth_headers)
+        assert r.status_code == 200
+        # Bob sends a new message.
+        _send(client, other_auth_headers, conv["conversation_id"], "yo!")
+        # Conversation should be back in Alice's default inbox.
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        ids = [c["conversation_id"] for c in r.json()["conversations"]]
+        assert conv["conversation_id"] in ids
+

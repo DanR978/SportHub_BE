@@ -6,6 +6,7 @@ from models.db_event_participant import DBEventParticipant
 from models.db_host_rating import DBHostRating
 from models.db_report import DBReport
 from models.db_block import DBBlock
+from models.db_event_ban import DBEventBan
 from models.db_bookmark import DBBookmark
 from schemas.event import Event, EventCreate, EventUpdate
 from sqlalchemy.orm import Session
@@ -75,6 +76,35 @@ def get_blocked_ids(db, user_id):
         return set()
     blocks = db.query(DBBlock.blocked_id).filter(DBBlock.blocker_id == user_id).all()
     return {b[0] for b in blocks}
+
+
+def _is_event_banned(db, event_id, user_id) -> bool:
+    if not user_id:
+        return False
+    return db.query(DBEventBan).filter_by(
+        event_id=event_id, user_id=user_id,
+    ).first() is not None
+
+
+def get_invisible_ids(db, user_id):
+    """Return set of user IDs whose content should be hidden from `user_id`.
+
+    Includes both directions of a block — anyone you blocked, AND anyone who
+    blocked you. Use this anywhere you'd otherwise expose another user's
+    content (events, posts, profiles in lists).
+    """
+    if not user_id:
+        return set()
+    out = set()
+    rows = db.query(DBBlock).filter(
+        (DBBlock.blocker_id == user_id) | (DBBlock.blocked_id == user_id)
+    ).all()
+    for r in rows:
+        if r.blocker_id == user_id:
+            out.add(r.blocked_id)
+        else:
+            out.add(r.blocker_id)
+    return out
 
 
 def archive_event(db, event, reason='expired'):
@@ -163,7 +193,7 @@ async def get_events(
     authorization: Optional[str] = Header(default=None),
 ):
     current_user_id = _get_user_id_from_header(authorization, db)
-    blocked = get_blocked_ids(db, current_user_id)
+    invisible = get_invisible_ids(db, current_user_id)
     today = date.today()
     events = db.query(DBEvent).filter(
         DBEvent.status == 'active',
@@ -171,7 +201,8 @@ async def get_events(
     ).all()
     result = []
     for event in events:
-        if event.organizer_id in blocked:
+        # Hide events organized by anyone the user blocked OR who blocked them.
+        if event.organizer_id in invisible:
             continue
         enrich_event(event, db, current_user_id)
         result.append(event)
@@ -191,7 +222,7 @@ async def filter_event(
     authorization: Optional[str] = Header(default=None),
 ):
     current_user_id = _get_user_id_from_header(authorization, db)
-    blocked = get_blocked_ids(db, current_user_id)
+    invisible = get_invisible_ids(db, current_user_id)
     today = date.today()
     query = db.query(DBEvent).filter(DBEvent.status == 'active', DBEvent.start_date >= today)
 
@@ -204,7 +235,7 @@ async def filter_event(
     if date_to:
         query = query.filter(DBEvent.start_date <= date_to)
 
-    events = [e for e in query.all() if e.organizer_id not in blocked]
+    events = [e for e in query.all() if e.organizer_id not in invisible]
 
     if latitude is not None and longitude is not None:
         nearby = []
@@ -278,6 +309,19 @@ async def join_event(event_id: UUID, db: Session = Depends(get_db), current_user
         raise HTTPException(status_code=400, detail="Event is not active")
     if db.query(DBEventParticipant).filter_by(event_id=event_id, user_id=current_user.user_id).first():
         raise HTTPException(status_code=400, detail="Already joined this event")
+
+    # If either side has blocked the other, the event is invisible to this
+    # user and they shouldn't be able to join it. 404 (not 403) so the
+    # block isn't disclosed.
+    if event.organizer_id:
+        invisible = get_invisible_ids(db, current_user.user_id)
+        if event.organizer_id in invisible:
+            raise HTTPException(status_code=404, detail="Event not found")
+
+    # Honor any per-event ban placed by the organizer.
+    if _is_event_banned(db, event_id, current_user.user_id):
+        raise HTTPException(status_code=403, detail="You can't join this event")
+
     count = db.query(DBEventParticipant).filter_by(event_id=event_id).count()
     if count >= event.max_players:
         raise HTTPException(status_code=400, detail="Event is full")
@@ -311,6 +355,60 @@ async def leave_event(event_id: UUID, db: Session = Depends(get_db), current_use
     db.delete(participant)
     db.commit()
     return {"message": "Left event successfully"}
+
+
+@router.delete("/sports-events/{event_id}/participants/{user_id}")
+async def kick_participant(
+    event_id: UUID,
+    user_id: UUID,
+    ban: bool = Query(False, description="Also ban the user from re-joining."),
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Organizer-only: remove a player from this event. Pass ?ban=true to
+    additionally prevent them from re-joining until the ban is lifted."""
+    event = db.query(DBEvent).filter(DBEvent.event_id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if event.organizer_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="Only the organizer can remove players")
+    if user_id == current_user.user_id:
+        raise HTTPException(status_code=400, detail="Use leave to remove yourself")
+
+    part = db.query(DBEventParticipant).filter_by(event_id=event_id, user_id=user_id).first()
+    if part:
+        db.delete(part)
+
+    if ban:
+        existing = db.query(DBEventBan).filter_by(event_id=event_id, user_id=user_id).first()
+        if not existing:
+            db.add(DBEventBan(event_id=event_id, user_id=user_id, banned_by=current_user.user_id))
+
+    db.commit()
+    return {"message": "Player removed", "banned": ban}
+
+
+@router.delete("/sports-events/{event_id}/bans/{user_id}")
+async def lift_event_ban(
+    event_id: UUID,
+    user_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Organizer-only: lift a ban so the user can re-join the event."""
+    event = db.query(DBEvent).filter(DBEvent.event_id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if event.organizer_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="Only the organizer can lift bans")
+
+    row = db.query(DBEventBan).filter_by(event_id=event_id, user_id=user_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="No active ban for this user")
+    db.delete(row)
+    db.commit()
+    return {"message": "Ban lifted"}
+
 
 @router.patch("/sports-events/{event_id}", response_model=Event)
 async def update_event(
@@ -759,6 +857,17 @@ async def block_user(
         ).first()
         if part:
             db.delete(part)
+
+    # Block also tears down the friendship in either direction. Unblocking
+    # later does NOT auto-restore — the user has to send a fresh request.
+    from models.db_friendship import DBFriendship
+    from sqlalchemy import or_, and_
+    db.query(DBFriendship).filter(
+        or_(
+            and_(DBFriendship.requester_id == current_user.user_id, DBFriendship.addressee_id == user_id),
+            and_(DBFriendship.requester_id == user_id, DBFriendship.addressee_id == current_user.user_id),
+        )
+    ).delete(synchronize_session=False)
 
     db.commit()
     return {"message": "User blocked"}

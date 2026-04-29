@@ -904,6 +904,14 @@ def send_message(
     if sender_member:
         sender_member.last_read_at = datetime.now(timezone.utc)
 
+    # A new message un-archives the conversation for *every* member who had
+    # it archived — both sender and recipients. People want their inbox to
+    # surface a chat when there's something fresh in it.
+    db.query(DBConversationMember).filter(
+        DBConversationMember.conversation_id == conversation_id,
+        DBConversationMember.archived_at.is_not(None),
+    ).update({"archived_at": None}, synchronize_session=False)
+
     db.commit()
     db.refresh(msg)
 
