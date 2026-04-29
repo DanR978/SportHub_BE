@@ -36,3 +36,7 @@ class DBConversationMember(Base):
     joined_at       = Column(DateTime(timezone=True), server_default=func.now())
     last_read_at    = Column(DateTime(timezone=True), server_default=func.now())
     is_admin        = Column(Boolean, nullable=False, server_default="false", default=False)
+    # Per-user state. Archiving hides a conversation from the default list
+    # without affecting other members. Favoriting pins it to the top.
+    archived_at     = Column(DateTime(timezone=True), nullable=True)
+    favorited_at    = Column(DateTime(timezone=True), nullable=True)

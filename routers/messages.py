@@ -219,18 +219,32 @@ def _read_state_for(db: Session, conversation_id: UUID, viewer_id: UUID,
     }
 
 
-def _list_conversations_payload(db: Session, viewer_id: UUID) -> List[dict]:
+def _list_conversations_payload(db: Session, viewer_id: UUID, include_archived: bool = False) -> List[dict]:
     """Bulk-load every conversation the viewer is in, plus the data needed to
-    render a list row, in a small fixed number of queries."""
-    convs: List[DBConversation] = (
-        db.query(DBConversation)
+    render a list row, in a small fixed number of queries.
+
+    By default archived conversations are filtered out — pass
+    include_archived=True to fetch them (used by an Archived inbox view).
+    Favorites are pinned to the top regardless.
+    """
+    q = (
+        db.query(DBConversation, DBConversationMember.archived_at, DBConversationMember.favorited_at)
         .join(DBConversationMember, DBConversation.conversation_id == DBConversationMember.conversation_id)
         .filter(DBConversationMember.user_id == viewer_id)
-        .order_by(DBConversation.last_message_at.desc())
-        .all()
     )
-    if not convs:
+    if not include_archived:
+        q = q.filter(DBConversationMember.archived_at.is_(None))
+    rows = q.order_by(DBConversation.last_message_at.desc()).all()
+    if not rows:
         return []
+    convs = [r[0] for r in rows]
+    archived_by_conv = {r[0].conversation_id: r[1] for r in rows}
+    favorited_by_conv = {r[0].conversation_id: r[2] for r in rows}
+    # Favorites pinned to top, both groups still in last_message_at desc order.
+    convs.sort(key=lambda c: (
+        0 if favorited_by_conv.get(c.conversation_id) else 1,
+        -(c.last_message_at.timestamp() if c.last_message_at else 0),
+    ))
 
     conv_ids = [c.conversation_id for c in convs]
 
@@ -313,7 +327,11 @@ def _list_conversations_payload(db: Session, viewer_id: UUID) -> List[dict]:
         member_payload = []
         for m in members:
             u = users.get(m.user_id)
-            member_payload.append({**_user_summary(u), "is_admin": bool(m.is_admin)})
+            # Belt-and-suspenders: even if the is_admin column is unset (eg
+            # a row created before migration 0005 backfilled), the conversation
+            # creator is always treated as an admin.
+            is_admin = bool(m.is_admin) or (conv.created_by is not None and m.user_id == conv.created_by)
+            member_payload.append({**_user_summary(u), "is_admin": is_admin})
 
         title = conv.title
         if not title:
@@ -339,12 +357,15 @@ def _list_conversations_payload(db: Session, viewer_id: UUID) -> List[dict]:
             "kind":            conv.kind,
             "title":           title,
             "image_url":       conv.image_url,
+            "created_by":      str(conv.created_by) if conv.created_by else None,
             "event_id":        str(conv.event_id) if conv.event_id else None,
             "members":         member_payload,
             "unread_count":    unread_counts.get(conv.conversation_id, 0),
             "last_message":    last_msg_payload,
             "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
             "read_state":      _read_state_for(db, conv.conversation_id, viewer_id, members),
+            "is_favorited":    favorited_by_conv.get(conv.conversation_id) is not None,
+            "is_archived":     archived_by_conv.get(conv.conversation_id) is not None,
         })
     return out
 
@@ -358,7 +379,12 @@ def _serialize_conversation(conv: DBConversation, db: Session, viewer_id: UUID) 
     )
     users = _bulk_user_map(db, [m.user_id for m in members])
     member_payload = [
-        {**_user_summary(users.get(m.user_id)), "is_admin": bool(m.is_admin)}
+        {
+            **_user_summary(users.get(m.user_id)),
+            "is_admin": bool(m.is_admin) or (
+                conv.created_by is not None and m.user_id == conv.created_by
+            ),
+        }
         for m in members
     ]
 
@@ -399,6 +425,7 @@ def _serialize_conversation(conv: DBConversation, db: Session, viewer_id: UUID) 
         "kind":            conv.kind,
         "title":           title,
         "image_url":       conv.image_url,
+        "created_by":      str(conv.created_by) if conv.created_by else None,
         "event_id":        str(conv.event_id) if conv.event_id else None,
         "members":         member_payload,
         "unread_count":    unread,
@@ -428,10 +455,15 @@ def _find_direct_conversation(db: Session, a: UUID, b: UUID) -> Optional[DBConve
 
 @router.get("/conversations")
 def list_conversations(
+    include_archived: bool = Query(False, description="Include archived conversations in the response."),
     db: Session = Depends(get_db),
     current_user: DBUser = Depends(get_current_user),
 ):
-    return {"conversations": _list_conversations_payload(db, current_user.user_id)}
+    return {
+        "conversations": _list_conversations_payload(
+            db, current_user.user_id, include_archived=include_archived,
+        ),
+    }
 
 
 @router.post("/direct")
@@ -927,6 +959,56 @@ def delete_message(
     db.delete(msg)
     db.commit()
     return {"status": "deleted"}
+
+
+@router.post("/conversations/{conversation_id}/archive")
+def archive_conversation(
+    conversation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Hide this conversation from the user's default inbox."""
+    member = _ensure_member(db, conversation_id, current_user.user_id)
+    member.archived_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "archived"}
+
+
+@router.delete("/conversations/{conversation_id}/archive")
+def unarchive_conversation(
+    conversation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    member = _ensure_member(db, conversation_id, current_user.user_id)
+    member.archived_at = None
+    db.commit()
+    return {"status": "active"}
+
+
+@router.post("/conversations/{conversation_id}/favorite")
+def favorite_conversation(
+    conversation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Pin this conversation to the top of the user's inbox."""
+    member = _ensure_member(db, conversation_id, current_user.user_id)
+    member.favorited_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "favorited"}
+
+
+@router.delete("/conversations/{conversation_id}/favorite")
+def unfavorite_conversation(
+    conversation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+):
+    member = _ensure_member(db, conversation_id, current_user.user_id)
+    member.favorited_at = None
+    db.commit()
+    return {"status": "unfavorited"}
 
 
 @router.post("/conversations/{conversation_id}/read")

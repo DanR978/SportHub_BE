@@ -701,3 +701,121 @@ class TestModeration:
             headers=auth_headers,
         )
         assert r.status_code == 400
+
+
+# ── Creator-as-admin fallback ────────────────────────────────────────────────
+
+class TestCreatorAdminFallback:
+    def test_creator_is_admin_in_serializer(self, client, user, other_user, auth_headers):
+        """Creator should always show as admin even if the column wasn't set
+        (e.g. row predates migration 0005)."""
+        conv = _start_group(client, auth_headers, [other_user.user_id], title="Crew")
+        creator_member = next(m for m in conv["members"] if m["user_id"] == str(user.user_id))
+        assert creator_member["is_admin"] is True
+
+    def test_created_by_field_present(self, client, user, other_user, auth_headers):
+        conv = _start_group(client, auth_headers, [other_user.user_id], title="Crew")
+        assert conv["created_by"] == str(user.user_id)
+
+    def test_creator_admin_fallback_when_column_false(
+        self, client, db, user, other_user, auth_headers,
+    ):
+        """If we manually clear is_admin on the creator row, the serializer
+        still surfaces them as admin via the created_by fallback."""
+        conv = _start_group(client, auth_headers, [other_user.user_id], title="Crew")
+        # Force the creator's is_admin off — simulates a pre-migration row.
+        from uuid import UUID as _UUID
+        cm = db.query(DBConversationMember).filter_by(
+            conversation_id=_UUID(conv["conversation_id"]),
+            user_id=user.user_id,
+        ).first()
+        cm.is_admin = False
+        db.commit()
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        convs = r.json()["conversations"]
+        match = next(c for c in convs if c["conversation_id"] == conv["conversation_id"])
+        creator_row = next(m for m in match["members"] if m["user_id"] == str(user.user_id))
+        assert creator_row["is_admin"] is True
+
+
+# ── Archive + favorite (per-user state) ──────────────────────────────────────
+
+class TestArchiveFavorite:
+    def test_archive_hides_from_default_list(
+        self, client, user, other_user, auth_headers,
+    ):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        r = client.post(
+            f"/messaging/conversations/{conv['conversation_id']}/archive",
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        ids = [c["conversation_id"] for c in r.json()["conversations"]]
+        assert conv["conversation_id"] not in ids
+
+        # Show up when explicitly requested.
+        r = client.get("/messaging/conversations?include_archived=true", headers=auth_headers)
+        match = next((c for c in r.json()["conversations"] if c["conversation_id"] == conv["conversation_id"]), None)
+        assert match is not None
+        assert match["is_archived"] is True
+
+    def test_unarchive_restores_visibility(self, client, user, other_user, auth_headers):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        client.post(f"/messaging/conversations/{conv['conversation_id']}/archive",
+                    headers=auth_headers)
+        r = client.delete(
+            f"/messaging/conversations/{conv['conversation_id']}/archive",
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        ids = [c["conversation_id"] for c in r.json()["conversations"]]
+        assert conv["conversation_id"] in ids
+
+    def test_archive_is_per_user(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        # Alice archives — Bob should still see it.
+        client.post(f"/messaging/conversations/{conv['conversation_id']}/archive",
+                    headers=auth_headers)
+        r = client.get("/messaging/conversations", headers=other_auth_headers)
+        ids = [c["conversation_id"] for c in r.json()["conversations"]]
+        assert conv["conversation_id"] in ids
+
+    def test_favorites_pinned_to_top(self, client, db, user, other_user, auth_headers):
+        carol = _make_extra_user(db, "carol@example.com")
+        # dm1 has the most recent message but dm2 will be favorited.
+        dm1 = _start_dm(client, auth_headers, other_user.user_id)
+        dm2 = _start_dm(client, auth_headers, carol.user_id)
+        _send(client, auth_headers, dm2["conversation_id"], "to carol")
+        _send(client, auth_headers, dm1["conversation_id"], "to bob")
+        # dm1 is now most recent. Without favoriting, dm1 would be first.
+        client.post(f"/messaging/conversations/{dm2['conversation_id']}/favorite",
+                    headers=auth_headers)
+
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        ids = [c["conversation_id"] for c in r.json()["conversations"]]
+        assert ids[0] == dm2["conversation_id"]
+
+    def test_unfavorite_returns_to_recency_order(
+        self, client, db, user, other_user, auth_headers,
+    ):
+        carol = _make_extra_user(db, "carol@example.com")
+        dm1 = _start_dm(client, auth_headers, other_user.user_id)
+        dm2 = _start_dm(client, auth_headers, carol.user_id)
+        _send(client, auth_headers, dm2["conversation_id"], "to carol")
+        _send(client, auth_headers, dm1["conversation_id"], "to bob")
+
+        client.post(f"/messaging/conversations/{dm2['conversation_id']}/favorite",
+                    headers=auth_headers)
+        client.delete(f"/messaging/conversations/{dm2['conversation_id']}/favorite",
+                      headers=auth_headers)
+
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        ids = [c["conversation_id"] for c in r.json()["conversations"]]
+        assert ids[0] == dm1["conversation_id"]
+
