@@ -108,6 +108,34 @@ def _blocked_between(db: Session, a: UUID, b: UUID) -> bool:
     ).first() is not None
 
 
+def _invisible_user_ids(db: Session, viewer_id: UUID) -> set:
+    """User IDs whose identity should be hidden from `viewer_id` — anyone the
+    viewer blocked OR who blocked the viewer. Used by the messaging serializers
+    to anonymize the other side of a blocked relationship.
+    """
+    if not viewer_id:
+        return set()
+    rows = db.query(DBBlock).filter(
+        (DBBlock.blocker_id == viewer_id) | (DBBlock.blocked_id == viewer_id)
+    ).all()
+    out = set()
+    for r in rows:
+        out.add(r.blocked_id if r.blocker_id == viewer_id else r.blocker_id)
+    return out
+
+
+def _redacted_summary() -> dict:
+    """Anonymized stand-in returned in place of a blocked user's profile."""
+    return {
+        "user_id":      None,
+        "name":         "Blocked user",
+        "avatar_photo": None,
+        "avatar_config":None,
+        "last_seen_at": None,
+        "blocked":      True,
+    }
+
+
 def _user_summary(user: Optional[DBUser]) -> dict:
     if not user:
         return {"user_id": None, "name": "Unknown", "avatar_photo": None}
@@ -130,11 +158,17 @@ def _bulk_user_map(db: Session, ids: Iterable[UUID]) -> Dict[UUID, DBUser]:
 def _serialize_message_with_users(m: DBMessage, users: Dict[UUID, DBUser],
                                   posts: Dict[UUID, DBPost] = None,
                                   events: Dict[UUID, DBEvent] = None,
-                                  post_authors: Dict[UUID, DBUser] = None) -> dict:
+                                  post_authors: Dict[UUID, DBUser] = None,
+                                  invisible: set = None) -> dict:
+    sender = (
+        _redacted_summary()
+        if invisible and m.sender_id in invisible
+        else _user_summary(users.get(m.sender_id))
+    )
     payload = {
         "message_id":      str(m.message_id),
         "conversation_id": str(m.conversation_id),
-        "sender":          _user_summary(users.get(m.sender_id)),
+        "sender":          sender,
         "kind":            m.kind,
         "body":            m.body,
         "image_url":       m.image_url,
@@ -162,7 +196,7 @@ def _serialize_message_with_users(m: DBMessage, users: Dict[UUID, DBUser],
     return payload
 
 
-def _serialize_message(m: DBMessage, db: Session) -> dict:
+def _serialize_message(m: DBMessage, db: Session, viewer_id: UUID = None) -> dict:
     """Single-message serializer (kept for the send_message return path).
 
     For lists of messages prefer _serialize_message_with_users with a prefetched
@@ -181,7 +215,8 @@ def _serialize_message(m: DBMessage, db: Session) -> dict:
         e = db.query(DBEvent).filter(DBEvent.event_id == m.shared_event_id).first()
         if e:
             events[e.event_id] = e
-    return _serialize_message_with_users(m, users, posts, events, post_authors)
+    invisible = _invisible_user_ids(db, viewer_id) if viewer_id else None
+    return _serialize_message_with_users(m, users, posts, events, post_authors, invisible)
 
 
 def _read_state_for(db: Session, conversation_id: UUID, viewer_id: UUID,
@@ -227,6 +262,7 @@ def _list_conversations_payload(db: Session, viewer_id: UUID, include_archived: 
     include_archived=True to fetch them (used by an Archived inbox view).
     Favorites are pinned to the top regardless.
     """
+    invisible = _invisible_user_ids(db, viewer_id)
     q = (
         db.query(DBConversation, DBConversationMember.archived_at, DBConversationMember.favorited_at)
         .join(DBConversationMember, DBConversation.conversation_id == DBConversationMember.conversation_id)
@@ -331,7 +367,12 @@ def _list_conversations_payload(db: Session, viewer_id: UUID, include_archived: 
             # a row created before migration 0005 backfilled), the conversation
             # creator is always treated as an admin.
             is_admin = bool(m.is_admin) or (conv.created_by is not None and m.user_id == conv.created_by)
-            member_payload.append({**_user_summary(u), "is_admin": is_admin})
+            base = (
+                _redacted_summary()
+                if (m.user_id in invisible and m.user_id != viewer_id)
+                else _user_summary(u)
+            )
+            member_payload.append({**base, "is_admin": is_admin})
 
         title = conv.title
         if not title:
@@ -348,7 +389,7 @@ def _list_conversations_payload(db: Session, viewer_id: UUID, include_archived: 
 
         last_msg = last_msgs.get(conv.conversation_id)
         last_msg_payload = (
-            _serialize_message_with_users(last_msg, users, posts, events, post_authors)
+            _serialize_message_with_users(last_msg, users, posts, events, post_authors, invisible)
             if last_msg else None
         )
 
@@ -378,15 +419,16 @@ def _serialize_conversation(conv: DBConversation, db: Session, viewer_id: UUID) 
         .all()
     )
     users = _bulk_user_map(db, [m.user_id for m in members])
-    member_payload = [
-        {
-            **_user_summary(users.get(m.user_id)),
-            "is_admin": bool(m.is_admin) or (
-                conv.created_by is not None and m.user_id == conv.created_by
-            ),
-        }
-        for m in members
-    ]
+    invisible = _invisible_user_ids(db, viewer_id)
+    member_payload = []
+    for m in members:
+        is_admin = bool(m.is_admin) or (conv.created_by is not None and m.user_id == conv.created_by)
+        base = (
+            _redacted_summary()
+            if (m.user_id in invisible and m.user_id != viewer_id)
+            else _user_summary(users.get(m.user_id))
+        )
+        member_payload.append({**base, "is_admin": is_admin})
 
     last_msg = (
         db.query(DBMessage)
@@ -429,7 +471,7 @@ def _serialize_conversation(conv: DBConversation, db: Session, viewer_id: UUID) 
         "event_id":        str(conv.event_id) if conv.event_id else None,
         "members":         member_payload,
         "unread_count":    unread,
-        "last_message":    _serialize_message(last_msg, db) if last_msg else None,
+        "last_message":    _serialize_message(last_msg, db, viewer_id) if last_msg else None,
         "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
     }
 
@@ -854,9 +896,10 @@ def list_messages(
         for e in db.query(DBEvent).filter(DBEvent.event_id.in_(shared_event_ids)).all():
             events[e.event_id] = e
     post_authors = _bulk_user_map(db, {p.author_id for p in posts.values()})
+    invisible = _invisible_user_ids(db, current_user.user_id)
 
     return {"messages": [
-        _serialize_message_with_users(m, users, posts, events, post_authors) for m in msgs
+        _serialize_message_with_users(m, users, posts, events, post_authors, invisible) for m in msgs
     ]}
 
 
@@ -877,6 +920,23 @@ def send_message(
         raise HTTPException(status_code=400, detail="Message body required")
     if body.body and len(body.body) > 2000:
         raise HTTPException(status_code=400, detail="Message is too long")
+
+    # In a 1:1 DM, refuse delivery if either side has blocked the other.
+    # We only enforce on direct chats — group/event chats stay functional but
+    # the other side's identity is anonymized in the read paths.
+    conv_for_block = db.query(DBConversation).filter(
+        DBConversation.conversation_id == conversation_id
+    ).first()
+    if conv_for_block and conv_for_block.kind == "direct":
+        other_member = db.query(DBConversationMember).filter(
+            DBConversationMember.conversation_id == conversation_id,
+            DBConversationMember.user_id != current_user.user_id,
+        ).first()
+        if other_member and _blocked_between(db, current_user.user_id, other_member.user_id):
+            raise HTTPException(
+                status_code=403,
+                detail="Messages can't be delivered between blocked users.",
+            )
 
     # Set created_at from Python so we get microsecond precision (SQLite's
     # server-side CURRENT_TIMESTAMP only has second resolution and would tie
@@ -938,7 +998,7 @@ def send_message(
     except Exception:
         pass
 
-    return _serialize_message(msg, db)
+    return _serialize_message(msg, db, current_user.user_id)
 
 
 @router.delete("/conversations/{conversation_id}/messages/{message_id}")
@@ -1046,15 +1106,19 @@ def conversation_read_receipts(
     members = db.query(DBConversationMember).filter_by(conversation_id=conversation_id).all()
     others = [m for m in members if m.user_id != current_user.user_id]
     user_map = _bulk_user_map(db, [m.user_id for m in others])
-    return {
-        "members": [
-            {
-                **_user_summary(user_map.get(m.user_id)),
-                "last_read_at": m.last_read_at.isoformat() if m.last_read_at else None,
-            }
-            for m in others
-        ],
-    }
+    invisible = _invisible_user_ids(db, current_user.user_id)
+    out = []
+    for m in others:
+        base = (
+            _redacted_summary()
+            if m.user_id in invisible
+            else _user_summary(user_map.get(m.user_id))
+        )
+        out.append({
+            **base,
+            "last_read_at": m.last_read_at.isoformat() if m.last_read_at else None,
+        })
+    return {"members": out}
 
 
 @router.get("/unread-summary")

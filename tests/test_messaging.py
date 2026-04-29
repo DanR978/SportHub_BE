@@ -834,3 +834,68 @@ class TestArchiveFavorite:
         ids = [c["conversation_id"] for c in r.json()["conversations"]]
         assert conv["conversation_id"] in ids
 
+
+
+# ── Block in DM: redaction + delivery refusal ────────────────────────────────
+
+class TestBlockedDM:
+    def test_send_to_blocked_user_403s(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        # Bob blocks Alice.
+        r = client.post(f"/users/{user.user_id}/block", headers=other_auth_headers)
+        assert r.status_code in (200, 201)
+        # Alice tries to send → 403, no delivery.
+        r = client.post(
+            f"/messaging/conversations/{conv['conversation_id']}/messages",
+            headers=auth_headers, json={"kind": "text", "body": "hello?"},
+        )
+        assert r.status_code == 403
+
+    def test_blocked_user_redacted_in_conversation_list(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        client.post(f"/users/{other_user.user_id}/block", headers=auth_headers)
+        r = client.get("/messaging/conversations", headers=auth_headers)
+        match = next(c for c in r.json()["conversations"] if c["conversation_id"] == conv["conversation_id"])
+        other_member = next(m for m in match["members"] if m["user_id"] != str(user.user_id))
+        # The other side gets the redacted summary.
+        assert other_member.get("blocked") is True
+        assert other_member["name"] == "Blocked user"
+        assert other_member["avatar_photo"] is None
+        # And user_id is null'd so the client can't link to a profile.
+        assert other_member["user_id"] is None
+
+    def test_blocked_sender_redacted_in_messages(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        # Bob sends a message before Alice blocks him.
+        _send(client, other_auth_headers, conv["conversation_id"], "hi alice")
+        # Alice blocks Bob.
+        client.post(f"/users/{other_user.user_id}/block", headers=auth_headers)
+        # When Alice fetches messages, Bob's identity is redacted.
+        r = client.get(
+            f"/messaging/conversations/{conv['conversation_id']}/messages",
+            headers=auth_headers,
+        )
+        msgs = r.json()["messages"]
+        assert msgs[-1]["sender"]["blocked"] is True
+        assert msgs[-1]["sender"]["name"] == "Blocked user"
+        assert msgs[-1]["sender"]["avatar_photo"] is None
+
+    def test_read_receipts_redact_blocked(
+        self, client, user, other_user, auth_headers, other_auth_headers,
+    ):
+        conv = _start_dm(client, auth_headers, other_user.user_id)
+        client.post(f"/users/{other_user.user_id}/block", headers=auth_headers)
+        r = client.get(
+            f"/messaging/conversations/{conv['conversation_id']}/read-receipts",
+            headers=auth_headers,
+        )
+        members = r.json()["members"]
+        assert len(members) == 1
+        assert members[0]["blocked"] is True
+        assert members[0]["name"] == "Blocked user"
