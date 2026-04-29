@@ -92,12 +92,11 @@ def _blocked_ids(db: Session, user_id: Optional[UUID]) -> set:
 
 def _serialize_author(user: Optional[DBUser]) -> dict:
     if not user:
-        return {"user_id": None, "name": "Unknown", "avatar_photo": None, "avatar_config": None}
+        return {"user_id": None, "name": "Unknown", "avatar_photo": None}
     return {
         "user_id":       str(user.user_id),
         "name":          f"{user.first_name or ''} {user.last_name or ''}".strip() or "Player",
         "avatar_photo":  user.avatar_photo,
-        "avatar_config": user.avatar_config,
         "host_rating":   float(user.host_rating) if user.host_rating else None,
     }
 

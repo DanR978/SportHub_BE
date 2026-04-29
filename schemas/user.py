@@ -19,7 +19,6 @@ class User(UserBase):
     user_id:       UUID = Field(default_factory=uuid4)
     bio:           Optional[str] = None
     sports:        Optional[str] = None
-    avatar_config: Optional[str] = None
     avatar_photo:  Optional[str] = None
     banner_photo:  Optional[str] = None
     host_rating:   Optional[Decimal] = None
@@ -48,7 +47,6 @@ class UserUpdate(BaseModel):
     phone_number:   Optional[str] = None
     bio:            Optional[str] = None
     sports:         Optional[str] = None
-    avatar_config:  Optional[str] = None
     avatar_photo:   Optional[str] = None
     banner_photo:   Optional[str] = None
     instagram:      Optional[str] = None

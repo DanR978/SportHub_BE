@@ -15,7 +15,6 @@ class DBUser(Base):
     phone_number   = Column(String(20), nullable=True)
     bio            = Column(String(300), nullable=True)
     sports         = Column(String, nullable=True)
-    avatar_config  = Column(String, nullable=True)
     avatar_photo   = Column(String, nullable=True)
     banner_photo   = Column(String, nullable=True)
     host_rating    = Column(Numeric(3, 2), nullable=True)

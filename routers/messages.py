@@ -124,7 +124,6 @@ def _redacted_summary() -> dict:
         "user_id":      None,
         "name":         "Blocked user",
         "avatar_photo": None,
-        "avatar_config":None,
         "last_seen_at": None,
         "blocked":      True,
     }
@@ -137,7 +136,6 @@ def _user_summary(user: Optional[DBUser]) -> dict:
         "user_id": str(user.user_id),
         "name": f"{user.first_name or ''} {user.last_name or ''}".strip() or "Player",
         "avatar_photo": user.avatar_photo,
-        "avatar_config": user.avatar_config,
     }
 
 

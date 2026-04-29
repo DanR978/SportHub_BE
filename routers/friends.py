@@ -36,7 +36,6 @@ def _user_summary(u: Optional[DBUser]) -> dict:
         "last_name":    u.last_name,
         "name":         f"{u.first_name or ''} {u.last_name or ''}".strip() or "Player",
         "avatar_photo": u.avatar_photo,
-        "avatar_config":u.avatar_config,
         "bio":          u.bio,
         "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
     }

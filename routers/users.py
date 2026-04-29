@@ -499,7 +499,6 @@ def search_users(
             "first_name":   u.first_name,
             "last_name":    u.last_name,
             "avatar_photo": u.avatar_photo,
-            "avatar_config":u.avatar_config,
             "bio":          u.bio,
         })
         if len(results) >= limit:

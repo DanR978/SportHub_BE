@@ -53,7 +53,6 @@ def enrich_event(event, db, current_user_id=None):
         organizer = db.query(DBUser).filter(DBUser.user_id == event.organizer_id).first()
         if organizer:
             event.organizer_name = f"{organizer.first_name or ''} {organizer.last_name or ''}".strip()
-            event.organizer_avatar = organizer.avatar_config
             event.organizer_photo = organizer.avatar_photo
             event.host_rating = float(organizer.host_rating) if organizer.host_rating else None
             event.total_ratings = organizer.total_ratings or 0
@@ -266,7 +265,6 @@ async def get_participants(event_id: UUID, db: Session = Depends(get_db)):
             "first_name":    user.first_name,
             "last_name":     user.last_name,
             "avatar_photo":  user.avatar_photo,
-            "avatar_config": user.avatar_config,
             "is_organizer":  user.user_id == event.organizer_id,
             "joined_at":     p.joined_at.isoformat() if p.joined_at else None,
         })
@@ -724,7 +722,6 @@ async def get_user_profile(user_id: UUID, db: Session = Depends(get_db)):
         "last_name":     user.last_name,
         "bio":           user.bio,
         "sports":        user.sports,
-        "avatar_config": user.avatar_config,
         "avatar_photo":  user.avatar_photo,
         "banner_photo":  user.banner_photo,
         "host_rating":   float(user.host_rating) if user.host_rating else None,
@@ -755,7 +752,6 @@ async def get_user_reviews(user_id: UUID, db: Session = Depends(get_db)):
             "created_at":     r.created_at.isoformat() if r.created_at else None,
             "reviewer_name":  f"{reviewer.first_name or ''} {reviewer.last_name or ''}".strip() if reviewer else "Unknown",
             "reviewer_photo": reviewer.avatar_photo if reviewer else None,
-            "reviewer_avatar":reviewer.avatar_config if reviewer else None,
         })
     return {"reviews": reviews}
 

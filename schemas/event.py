@@ -43,7 +43,6 @@ class Event(EventBase):
     joined: bool = False
     is_organizer: bool = False
     organizer_name: str | None = None
-    organizer_avatar: str | None = None
     organizer_photo: str | None = None
     host_rating:   float | None = None
     total_ratings: int = 0
