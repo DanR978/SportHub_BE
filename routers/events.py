@@ -70,12 +70,9 @@ def enrich_event(event, db, current_user_id=None):
     return event
 
 
-def get_blocked_ids(db, user_id):
-    """Return set of user IDs that this user has blocked."""
-    if not user_id:
-        return set()
-    blocks = db.query(DBBlock.blocked_id).filter(DBBlock.blocker_id == user_id).all()
-    return {b[0] for b in blocks}
+# Block helpers live in blocks.py — re-export under the existing names so
+# the rest of this module + any external imports keep working.
+from blocks import get_blocked_ids, invisible_user_ids as get_invisible_ids  # noqa: E402,F401
 
 
 def _is_event_banned(db, event_id, user_id) -> bool:
@@ -84,27 +81,6 @@ def _is_event_banned(db, event_id, user_id) -> bool:
     return db.query(DBEventBan).filter_by(
         event_id=event_id, user_id=user_id,
     ).first() is not None
-
-
-def get_invisible_ids(db, user_id):
-    """Return set of user IDs whose content should be hidden from `user_id`.
-
-    Includes both directions of a block — anyone you blocked, AND anyone who
-    blocked you. Use this anywhere you'd otherwise expose another user's
-    content (events, posts, profiles in lists).
-    """
-    if not user_id:
-        return set()
-    out = set()
-    rows = db.query(DBBlock).filter(
-        (DBBlock.blocker_id == user_id) | (DBBlock.blocked_id == user_id)
-    ).all()
-    for r in rows:
-        if r.blocker_id == user_id:
-            out.add(r.blocked_id)
-        else:
-            out.add(r.blocker_id)
-    return out
 
 
 def archive_event(db, event, reason='expired'):

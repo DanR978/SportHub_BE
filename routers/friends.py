@@ -17,7 +17,6 @@ from sqlalchemy.orm import Session
 from database import get_db
 from auth import get_current_user
 from models.db_user import DBUser
-from models.db_block import DBBlock
 from models.db_friendship import DBFriendship
 
 
@@ -52,13 +51,9 @@ def _find_pair(db: Session, a: UUID, b: UUID) -> Optional[DBFriendship]:
     ).first()
 
 
-def _blocked_between(db: Session, a: UUID, b: UUID) -> bool:
-    return db.query(DBBlock).filter(
-        or_(
-            and_(DBBlock.blocker_id == a, DBBlock.blocked_id == b),
-            and_(DBBlock.blocker_id == b, DBBlock.blocked_id == a),
-        )
-    ).first() is not None
+# Defined in blocks.py — re-exported under the existing name so call sites
+# below don't change.
+from blocks import is_blocked_between as _blocked_between  # noqa: E402
 
 
 @router.post("/request")

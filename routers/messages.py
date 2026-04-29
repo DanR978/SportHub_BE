@@ -30,7 +30,6 @@ from auth import get_current_user
 from models.db_user import DBUser
 from models.db_event import DBEvent
 from models.db_event_participant import DBEventParticipant
-from models.db_block import DBBlock
 from models.db_post import DBPost
 from models.db_friendship import DBFriendship
 from models.db_conversation import DBConversation, DBConversationMember
@@ -113,27 +112,10 @@ def _ensure_admin(db: Session, conv: DBConversation, user_id: UUID) -> DBConvers
     return member
 
 
-def _blocked_between(db: Session, a: UUID, b: UUID) -> bool:
-    return db.query(DBBlock).filter(
-        ((DBBlock.blocker_id == a) & (DBBlock.blocked_id == b)) |
-        ((DBBlock.blocker_id == b) & (DBBlock.blocked_id == a))
-    ).first() is not None
-
-
-def _invisible_user_ids(db: Session, viewer_id: UUID) -> set:
-    """User IDs whose identity should be hidden from `viewer_id` — anyone the
-    viewer blocked OR who blocked the viewer. Used by the messaging serializers
-    to anonymize the other side of a blocked relationship.
-    """
-    if not viewer_id:
-        return set()
-    rows = db.query(DBBlock).filter(
-        (DBBlock.blocker_id == viewer_id) | (DBBlock.blocked_id == viewer_id)
-    ).all()
-    out = set()
-    for r in rows:
-        out.add(r.blocked_id if r.blocker_id == viewer_id else r.blocker_id)
-    return out
+# Block helpers live in `blocks.py` — keep these aliases so the rest of this
+# module doesn't have to change naming.
+from blocks import is_blocked_between as _blocked_between  # noqa: E402
+from blocks import invisible_user_ids as _invisible_user_ids  # noqa: E402
 
 
 def _redacted_summary() -> dict:
