@@ -19,6 +19,7 @@ class DBMessage(Base):
     body            = Column(Text, nullable=True)
     shared_post_id  = Column(Uuid(as_uuid=True), ForeignKey("posts.post_id"), nullable=True)
     shared_event_id = Column(Uuid(as_uuid=True), ForeignKey("events.event_id"), nullable=True)
-    image_url       = Column(String(512), nullable=True)
+    # TEXT so S3 signed URLs and dev-mode base64 fallbacks both fit.
+    image_url       = Column(Text, nullable=True)
 
     created_at      = Column(DateTime(timezone=True), server_default=func.now(), index=True)

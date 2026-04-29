@@ -16,7 +16,9 @@ class DBPost(Base):
     author_id     = Column(Uuid(as_uuid=True), ForeignKey("users.user_id"), nullable=False, index=True)
 
     body          = Column(Text, nullable=False)
-    image_url     = Column(String(512), nullable=True)
+    # TEXT — long enough to hold S3 signed URLs *and* (in dev with no S3) the
+    # base64-encoded fallback the storage helper produces.
+    image_url     = Column(Text, nullable=True)
 
     # Optional tags / grouping
     sport         = Column(String(40), nullable=True, index=True)

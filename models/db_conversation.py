@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, String, ForeignKey, Uuid
+from sqlalchemy import Boolean, Column, DateTime, String, Text, ForeignKey, Uuid
 from sqlalchemy.sql import func
 import uuid
 from database import Base
@@ -14,7 +14,8 @@ class DBConversation(Base):
     conversation_id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     kind            = Column(String(16), nullable=False, default="direct")  # direct | group | event
     title           = Column(String(120), nullable=True)
-    image_url       = Column(String(512), nullable=True)
+    # TEXT so S3 signed URLs and dev-mode base64 fallbacks both fit.
+    image_url       = Column(Text, nullable=True)
     event_id        = Column(Uuid(as_uuid=True), ForeignKey("events.event_id"), nullable=True, index=True)
     created_by      = Column(Uuid(as_uuid=True), ForeignKey("users.user_id"), nullable=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
